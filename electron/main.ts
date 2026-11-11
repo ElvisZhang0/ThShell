@@ -46,7 +46,8 @@ import {
   downloadUpdate,
   installUpdate,
   parseManifest,
-  pickAsset
+  pickAsset,
+  withFallbackUrls
 } from './modules/updater'
 import {
   appendTransfer,
@@ -69,7 +70,7 @@ import {
   renameLocal,
   writeLocalFile
 } from './modules/local-fs'
-import { DEFAULT_UPDATE_FEED } from './types'
+import { DEFAULT_UPDATE_FEEDS } from './types'
 import type { AppInfo, FileEntry, PasteMode, ServerConfig, TransferProgress, UpdateAsset } from './types'
 import type { TextEncoding } from './modules/text-guard'
 
@@ -3325,9 +3326,48 @@ function createWindow(): void {
         push('JSON 坏掉时给出可读的错误', !!broken.error, broken.error ?? '无')
         const missing = await checkForUpdates(`${base}/nope.json`)
         push('404 时把状态码带出来', (missing.error ?? '').includes('404'), missing.error ?? '无')
-        // 空源不再报"没配" —— 它会落到内置的 GitHub 源（types.ts 的 DEFAULT_UPDATE_FEED）。
-        // 那条路要真联网，冒烟里只验常量本身，别在这儿等超时。
-        push('空更新源不再报"没配"', DEFAULT_UPDATE_FEED.includes('/releases/latest/download/'), DEFAULT_UPDATE_FEED)
+
+        // 内置候选：直连 + 两个国内加速镜像。空源会并发试这三条，
+        // 冒烟里只验常量形态，不真去连 GitHub（那要等超时）
+        push('内置三条更新通道', DEFAULT_UPDATE_FEEDS.length === 3, `${DEFAULT_UPDATE_FEEDS.length} 条`)
+        push(
+          '后两条是国内加速镜像',
+          DEFAULT_UPDATE_FEEDS.slice(1).every((u) => /ghfast\.top|gh-proxy\.com/.test(u)),
+          DEFAULT_UPDATE_FEEDS.slice(1).map((u) => u.split('/')[2]).join(' / ')
+        )
+        push(
+          '每条都指向 releases/latest/download',
+          DEFAULT_UPDATE_FEEDS.every((u) => u.endsWith('/releases/latest/download/latest.json'))
+        )
+
+        // 多通道并发：一个坏一个好，应该用好的那个，并把实际通道回报出来
+        const multi = await checkForUpdates([`${base}/nope.json`, `${base}/new.json`])
+        push('通道里有一个通就行', multi.hasUpdate && multi.latest === '9.9.9', `${multi.latest ?? '无'}`)
+        push('回报了实际走通的那条', (multi.feed ?? '') === `${base}/new.json`, multi.feed ?? '无')
+
+        // 下载地址自动补镜像：latest.json 里不写 mirrors 也能换道
+        const direct = withFallbackUrls({
+          platform: 'win32',
+          arch: 'x64',
+          format: 'exe',
+          url: 'https://github.com/ElvisZhang0/ThShell/releases/latest/download/a.exe'
+        })
+        push(
+          '直连地址自动补上镜像',
+          (direct.mirrors?.length ?? 0) >= 2 && direct.mirrors!.every((u) => u.includes('github.com')),
+          `${direct.mirrors?.length ?? 0} 条备用`
+        )
+        const fromMirror = withFallbackUrls({
+          platform: 'win32',
+          arch: 'x64',
+          format: 'exe',
+          url: 'https://ghfast.top/https://github.com/x/y/releases/download/v1/a.exe'
+        })
+        push(
+          '镜像地址反推出直连',
+          fromMirror.mirrors?.[0] === 'https://github.com/x/y/releases/download/v1/a.exe',
+          fromMirror.mirrors?.[0] ?? '无'
+        )
 
         // 5. 下载 + 校验和
         let lastPercent = 0
@@ -3362,13 +3402,6 @@ function createWindow(): void {
           shapeErr = err instanceof Error ? err.message : String(err)
         }
         push('缺字段的 manifest 被拒绝', shapeErr.includes('version'), shapeErr)
-
-        // 8. 内置更新源指向 GitHub Releases 的固定地址
-        push(
-          '默认源指向 releases/latest/download',
-          DEFAULT_UPDATE_FEED.endsWith('/releases/latest/download/latest.json'),
-          DEFAULT_UPDATE_FEED
-        )
 
         // 免安装版不能当更新包：拉起它只是又开一个实例，用户以为更新了其实没换
         const portablePick = pickAsset(

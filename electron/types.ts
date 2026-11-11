@@ -44,8 +44,8 @@ export interface AppSettings {
   /**
    * 更新源：指向一个 latest.json 的完整 URL（支持 http/https 与 file://）。
    *
-   * **留空 = 用内置的 {{DEFAULT_UPDATE_FEED}}（GitHub Releases）** —— 装完就能查更新，
-   * 不需要用户配任何东西。填了就用填的（内网静态目录、共享盘都行）。
+   * **留空 = 用内置的 GitHub Releases 通道（含国内加速镜像，自动选可用的）** ——
+   * 装完就能查更新，不需要用户配任何东西。填了就用填的（内网静态目录、共享盘都行）。
    */
   updateFeed: string
   /**
@@ -56,18 +56,32 @@ export interface AppSettings {
 }
 
 /**
- * 内置更新源。
+ * 内置更新源的候选通道 —— 并发尝试，谁先给出结果用谁。
  *
- * 用 GitHub Releases 的 `releases/latest/download/<文件名>` —— 这个地址**永远指向最新 release
- * 的同名附件**，所以发版时不用改任何代码、不用固定 tag、也不用手动删旧文件：
- * 打 tag → 传 latest.json 和安装包 → 客户端下次检查就看到了。
+ * 为什么是数组而不是一个地址：github.com 在国内直连经常超时，但同一个资源套上
+ * 加速前缀（`https://ghfast.top/https://github.com/...`）几乎总能拿到。
+ * 三个一起发比串行等超时快得多 —— 串行的话每个源 8 秒，最坏 24 秒，用户早把弹窗关了。
+ *
+ * 地址用的是 `releases/latest/download/<文件名>`：**永远指向最新 release 的同名附件**，
+ * 所以发版时不用改代码、不用固定 tag、也不用手动删旧文件。
  *
  * 只对 **public 仓库**有效：private 仓库的 Release 附件匿名下载是 404。
- * 国内直连 github.com 不稳时，在 latest.json 里给每个包配 `mirrors`，或直接把
- * updateFeed 换成自建地址。
  */
-export const DEFAULT_UPDATE_FEED =
-  'https://github.com/ElvisZhang0/ThShell/releases/latest/download/latest.json'
+export const DEFAULT_UPDATE_FEEDS: string[] = [
+  'https://github.com/ElvisZhang0/ThShell/releases/latest/download/latest.json',
+  'https://ghfast.top/https://github.com/ElvisZhang0/ThShell/releases/latest/download/latest.json',
+  'https://gh-proxy.com/https://github.com/ElvisZhang0/ThShell/releases/latest/download/latest.json'
+]
+
+/** 主源（直连）。仅用于展示与兜底，真正的候选列表是 DEFAULT_UPDATE_FEEDS */
+export const DEFAULT_UPDATE_FEED = DEFAULT_UPDATE_FEEDS[0]
+
+/**
+ * 已知可用的 GitHub 加速前缀。
+ * 下载地址不管是从哪个通道拿来的，都会自动补上这些前缀当备用 ——
+ * 这样 latest.json 里不写 `mirrors`，直连下不动时也能换道。
+ */
+export const GH_MIRROR_PREFIXES = ['https://ghfast.top/', 'https://gh-proxy.com/']
 
 /* ---------------- 检查更新 ---------------- */
 
@@ -107,6 +121,8 @@ export interface UpdateCheckResult {
   notes?: string
   /** 当前平台该下载哪个包 */
   asset?: UpdateAsset
+  /** 实际取到数据的那条通道（直连或某个加速镜像），界面上告诉用户走的是哪条 */
+  feed?: string
   /** 失败了：网络、JSON 格式、版本号非法…… 原样带出来给用户看 */
   error?: string
   /** 版本更新了，但更新源里没有我这个平台的包 */

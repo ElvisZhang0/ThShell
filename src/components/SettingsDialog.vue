@@ -155,9 +155,8 @@ async function save() {
           :placeholder="DEFAULT_UPDATE_FEED"
         />
         <div class="hint" style="margin-top: 6px">
-          默认走 GitHub Releases（<code class="mono">releases/latest/download/latest.json</code>），
-          发版时把清单和安装包传到 Release 即可，什么都不用配。
-          内网机器可以在这里填自己的静态目录或共享盘（支持 http/https 与 file://）。
+          留空就用内置通道：GitHub 直连 + 国内加速镜像并发探路，谁通走谁，不用配。
+          要换成自己的静态目录或共享盘（支持 http/https 与 file://）就填在这里，填了就只走它。
         </div>
       </div>
     </div>

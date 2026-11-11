@@ -79,10 +79,9 @@ const SHORTCUTS: Array<[string, string]> = [
           启动时也会静默查一次，有新版只在「关于」按钮上点一个小圆点，不弹窗打断你。
         </p>
         <p>
-          更新源默认就是 <strong>GitHub Releases</strong>（<code class="mono">releases/latest/download/latest.json</code>），
-          开箱即用，什么都不用配。想换的话在 <strong>配置 → 更新源</strong> 里填自己的静态目录即可，
-          那一格留空就又回到官方源。纯内网机器可以在同一页把「启动时自动检查」关掉，
-          那就只有手动点「检查更新」才会联网。
+          更新源默认就是 <strong>GitHub Releases</strong>，而且内置了国内加速通道（直连 + 两个镜像并发探路，
+          谁通走谁），开箱即用，什么都不用配。想换的话在 <strong>配置 → 更新源</strong> 里填自己的静态目录，
+          填了就只走它。纯内网机器可以在同一页把「启动时自动检查」关掉，那就只有手动点「检查更新」才会联网。
         </p>
       </section>
 

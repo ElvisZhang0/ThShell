@@ -3,14 +3,14 @@ import { DEFAULT_UPDATE_FEED } from '../../electron/types'
 import type { UpdateCheckResult, UpdateProgress } from '../../electron/types'
 
 /**
- * 把配置里的更新源解析成真正要请求的地址。
+ * 给界面看的"当前更新源"文案。
  *
- * 空 = 用内置的 GitHub Releases（装完就能用，不需要用户配任何东西）。
- * 这个函数单独抽出来是为了能在冒烟里离线断言 —— 否则只能真发一次请求才知道解析对不对。
+ * 真正的通道选择在主进程里做（直连 + 国内加速镜像并发，谁先回用谁），
+ * 所以配置留空时这里只能给个概括 —— 具体走了哪条，等结果回来有 `result.feed`。
  */
-export function resolveFeed(feed: string | undefined | null): string {
-  const custom = (feed || '').trim()
-  return custom || DEFAULT_UPDATE_FEED
+export function feedLabel(custom: string | undefined | null): string {
+  const c = (custom || '').trim()
+  return c || DEFAULT_UPDATE_FEED
 }
 
 /**
@@ -42,7 +42,8 @@ export function resetDownload(): void {
 /** 检查一次。返回结果方便调用方决定要不要弹窗（启动时的静默检查只看 available） */
 export async function runCheck(feed: string): Promise<UpdateCheckResult | null> {
   if (updateState.checking) return updateState.result
-  const target = resolveFeed(feed)
+  // 空串交给主进程：它会在「直连 + 国内镜像」里并发挑一条能通的
+  const target = (feed || '').trim()
   updateState.checking = true
   updateState.error = ''
   updateState.message = ''

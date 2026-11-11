@@ -53,7 +53,7 @@ const EMPTY_CONFIG: AppConfig = {
     fontSize: 14,
     metricInterval: 3000,
     copyOnSelect: true,
-    // 空 = 用内置 GitHub 源（见 update-state.ts 的 resolveFeed）
+    // 空 = 用内置通道（GitHub 直连 + 国内镜像，主进程自己挑能通的）
     updateFeed: '',
     updateAutoCheck: true
   }

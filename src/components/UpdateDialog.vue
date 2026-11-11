@@ -4,7 +4,7 @@ import { useAppStore } from '../stores/app'
 import { formatSize, formatSpeed } from '../utils/transfer-format'
 import {
   cancelDownload,
-  resolveFeed,
+  feedLabel,
   runCheck,
   runDownload,
   runInstall,
@@ -24,13 +24,14 @@ const visible = computed({
   set: (v: boolean) => emit('update:modelValue', v)
 })
 
-/**
- * 空 = 用内置 GitHub 源（resolveFeed 里兜底），所以这里只是"当前生效的地址"，
- * 界面不再有"没配更新源"这种状态 —— 装完就能查。
- */
-const feed = computed(() => resolveFeed(store.config.settings.updateFeed))
 const r = computed(() => updateState.result)
 const pct = computed(() => updateState.progress.percent)
+
+/**
+ * 当前生效的更新源：检查完就用主进程回报的**实际通道**（可能是某个镜像），
+ * 还没查完时只能给配置里的值或内置主源 —— 具体走哪条要等结果。
+ */
+const feed = computed(() => r.value?.feed || feedLabel(store.config.settings.updateFeed))
 
 const assetLabel = computed(() => {
   const a = r.value?.asset

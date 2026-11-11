@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { DEFAULT_UPDATE_FEED } from '../types'
+import { DEFAULT_UPDATE_FEEDS, GH_MIRROR_PREFIXES } from '../types'
 import type { UpdateAsset, UpdateCheckResult, UpdateManifest, UpdateProgress } from '../types'
 
 /**
@@ -110,36 +110,107 @@ async function readText(url: string, signal: AbortSignal): Promise<string> {
   return res.text()
 }
 
+/** 把一个地址缩短成"牌子"，报错时说人话：`https://ghfast.top/https://github.com/x` → `ghfast.top` */
+function channelName(url: string): string {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
+
+/**
+ * 把下载地址补齐成"多条通道"。
+ *
+ * 为什么要自动补：latest.json 里的地址可能是直连 github.com 的，也可能是带加速前缀的。
+ * 直连在国内常常断流，而同一份文件套上镜像前缀就能下 —— 与其发版时手写 mirrors，
+ * 不如客户端自己推出来：
+ *   - 地址带 github.com → 顺带补上每个已知镜像前缀
+ *   - 地址已经套了镜像前缀 → 补上剥掉前缀的原始 GitHub 地址
+ * 用户自己配的 mirrors 优先级最高，排在最前面。
+ */
+export function withFallbackUrls(asset: UpdateAsset): UpdateAsset {
+  const extra: string[] = []
+  const inner = asset.url.match(/^https?:\/\/[^/]+\/(https:\/\/github\.com\/.+)$/i)
+  if (inner) {
+    // 已经是镜像地址：原始 GitHub 地址作为第一备用
+    extra.push(inner[1])
+  } else if (/^https?:\/\/github\.com\//i.test(asset.url)) {
+    for (const prefix of GH_MIRROR_PREFIXES) extra.push(prefix + asset.url)
+  }
+  if (!extra.length) return asset
+
+  const merged = [...(asset.mirrors ?? [])]
+  for (const u of extra) if (!merged.includes(u) && u !== asset.url) merged.push(u)
+  return { ...asset, mirrors: merged.length ? merged : undefined }
+}
+
 /**
  * 拉取 latest.json 并跟当前版本比对。
- * 任何一步失败都写进 `error` 而不是抛出去 —— 调用方是界面，抛异常只会得到一个红框。
+ *
+ * `feed` 可以是单个地址、一组地址，或空字符串：
+ *   - 空 → 用内置的 DEFAULT_UPDATE_FEEDS（直连 + 国内加速镜像）
+ *   - 数组 → 依次/并发尝试这组地址（冒烟和调试用）
+ *   - 字符串 → 只用它（用户自己配的内网源，不该再偷偷去连 GitHub）
+ *
+ * 多个候选是**并发**发的，谁先成功用谁：串行等超时的话，三个源最坏要 24 秒，
+ * 用户早就把弹窗关了。任何一步失败都写进 `error` 而不是抛出去 —— 调用方是界面。
  */
-export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> {
+export async function checkForUpdates(feed: string | string[]): Promise<UpdateCheckResult> {
   const current = app.getVersion()
-  // 空就落到内置的 GitHub 源 —— 界面那边也会解析一次，这里兜底是为了
-  // "配置是空但提示没配源"这种自相矛盾的情况永远不会出现
-  const url = (feed || '').trim() || DEFAULT_UPDATE_FEED
+  const requested = (Array.isArray(feed) ? feed : [feed])
+    .map((u) => (u || '').trim())
+    .filter(Boolean)
+  const candidates = requested.length ? requested : DEFAULT_UPDATE_FEEDS
 
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 15_000)
+  const timer = setTimeout(() => controller.abort(), 12_000)
+  const failures: string[] = []
+
   try {
-    const text = await readText(url, controller.signal)
-    let raw: unknown
-    try {
-      raw = JSON.parse(text)
-    } catch {
-      throw new Error('更新描述不是合法 JSON')
-    }
-    const manifest = parseManifest(raw)
-    // 相对路径按 feed 的位置解析：一个目录里放 latest.json 和安装包，写相对路径最省事。
-    // 用 GitHub Releases 时这一条正好把 `ThShell-0.2.0-win-setup.exe` 解析成
-    // `.../releases/latest/download/ThShell-0.2.0-win-setup.exe` —— 不用写死域名。
-    const abs = (u: string) => new URL(u, url).toString()
-    manifest.assets = manifest.assets.map((a) => ({
-      ...a,
-      url: abs(a.url),
-      mirrors: a.mirrors?.map(abs)
-    }))
+    const picked = await new Promise<{ manifest: UpdateManifest; source: string }>(
+      (resolve, reject) => {
+        let left = candidates.length
+        let settled = false
+        const fail = (source: string, err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err)
+          // 只有多条通道时才标"是哪条挂的"；单源报错加个域名前缀纯属噪音
+          failures.push(candidates.length > 1 ? `${channelName(source)}：${msg}` : msg)
+        }
+        for (const source of candidates) {
+          void (async () => {
+            try {
+              const text = await readText(source, controller.signal)
+              let raw: unknown
+              try {
+                raw = JSON.parse(text)
+              } catch {
+                throw new Error('不是合法 JSON')
+              }
+              const manifest = parseManifest(raw)
+              if (!settled) {
+                settled = true
+                resolve({ manifest, source })
+              }
+            } catch (err) {
+              fail(source, err)
+            } finally {
+              left -= 1
+              if (left === 0 && !settled) reject(new Error(failures.join('；') || '没有可用的通道'))
+            }
+          })()
+        }
+      }
+    )
+
+    const { manifest, source } = picked
+    // 相对路径按**取到数据的那条通道**解析：一个目录里放 latest.json 和安装包最省事。
+    // 走镜像时这一条顺手把下载也带上镜像前缀（`.../releases/latest/download/<文件名>`），
+    // 所以 JSON 里写文件名就够了。
+    const abs = (u: string) => new URL(u, source).toString()
+    manifest.assets = manifest.assets.map((a) =>
+      withFallbackUrls({ ...a, url: abs(a.url), mirrors: a.mirrors?.map(abs) })
+    )
 
     const hasUpdate = compareVersions(manifest.version, current) > 0
     const asset = hasUpdate ? pickAsset(manifest) : undefined
@@ -149,6 +220,7 @@ export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> 
       hasUpdate,
       notes: manifest.notes,
       asset,
+      feed: source,
       unsupported:
         hasUpdate && !asset
           ? `更新源里没有 ${process.platform}/${process.arch} 可自动更新的包（免安装版不算）`
@@ -156,15 +228,14 @@ export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> 
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    // GitHub 作为更新源时，失败十有八九是网络到不了 —— 别让用户对着 "fetch failed" 发呆
-    const onGitHub = /^https?:\/\/(www\.)?github\.com\//i.test(url)
-    const hint = onGitHub
-      ? '（GitHub 在国内经常连不上：可在「配置 → 更新源」换成自建地址，或在 latest.json 里给每个包加 mirrors）'
-      : ''
     return {
       current,
       hasUpdate: false,
-      error: (controller.signal.aborted ? '连接更新源超时（15 秒）' : msg) + hint
+      error: controller.signal.aborted
+        ? '连接更新源超时（12 秒，直连和镜像都没通）'
+        : candidates.length > 1
+          ? `所有通道都没取到更新描述 —— ${msg}`
+          : msg
     }
   } finally {
     clearTimeout(timer)
