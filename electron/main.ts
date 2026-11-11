@@ -3578,6 +3578,32 @@ function createWindow(): void {
         )
         await shot('thshell-bar-about.png')
 
+        // 下拉项的选中底色必须跟侧栏选中项是同一个 token（--accent-soft）。
+        // EP 默认用 primary-light-9，深色主题下会浮出一层青绿，跟侧栏不是一套语言。
+        // 用"把变量解析成实际颜色再比对"来断言，比写死 rgba 值耐主题切换。
+        const tint = (await js(`(() => {
+          const root = document.querySelector('.tb-dropdown')
+          if (!root) return { same: false, why: '下拉没挂上 .tb-dropdown' }
+          const item = [...root.querySelectorAll('.el-dropdown-menu__item')]
+            .find((i) => i.textContent.includes('检查更新'))
+          if (!item) return { same: false, why: '没找到检查更新那一项' }
+          item.focus()
+          const got = getComputedStyle(item).backgroundColor
+          const raw = getComputedStyle(root).getPropertyValue('--accent-soft').trim()
+          const probe = document.createElement('div')
+          probe.style.backgroundColor = raw
+          document.body.appendChild(probe)
+          const want = getComputedStyle(probe).backgroundColor
+          probe.remove()
+          return { same: got === want, got, want }
+        })()`)) as { same: boolean; got?: string; want?: string; why?: string }
+        push(
+          '下拉选中底色与侧栏选中项一致',
+          tint.same,
+          tint.why ?? `选中 ${tint.got} / 侧栏 ${tint.want}`
+        )
+        await shot('thshell-bar-dropdown-tint.png')
+
         await clickMenu('配置')
         await wait(700)
         push('「配置」打开设置弹窗', await dialogOpen('设置'))

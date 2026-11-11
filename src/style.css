@@ -469,6 +469,19 @@ textarea {
 
 /* ---------- 标题栏「关于」下拉 ----------
    同样 teleport 到 body，样式只能写在这儿 */
+/*
+ * 下拉项的悬停/选中底色，统一成侧栏选中项那个色（--accent-soft）。
+ * Element Plus 默认走 --el-dropdown-menuItem-hover-fill（= primary-light-9），
+ * 深色主题下会浮出一层很扎眼的青绿，跟侧栏的墨绿选中态明显不是一套语言。
+ * 顺带把悬停文字收回到正文色 —— 原本是青绿字压青绿底，读起来糊成一片。
+ * 变量覆盖写在 popper 根节点上，子项自然继承，也不用跟 EP 的选择器拼优先级。
+ */
+.tb-dropdown,
+.pl-dropdown {
+  --el-dropdown-menuItem-hover-fill: var(--accent-soft);
+  --el-dropdown-menuItem-hover-color: var(--text-1);
+}
+
 .tb-dropdown .el-dropdown-menu__item {
   min-width: 132px;
   font-size: 12.5px;
