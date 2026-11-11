@@ -77,7 +77,10 @@ function goSettings(): void {
         <div class="row muted">
           当前版本 <span class="mono">{{ r.current || '—' }}</span>
         </div>
-        <div v-if="!feed" class="row muted">在「配置 → 检查更新」里填一个 latest.json 的地址就能用。</div>
+        <div v-if="!feed" class="row muted">
+          这一格现在是空的（= 关掉了检查更新）。在「配置 → 更新源」里点「恢复官方 GitHub 源」就能用；
+          内网机器也可以填自己的静态目录。
+        </div>
       </template>
 
       <!-- 有新版本 -->

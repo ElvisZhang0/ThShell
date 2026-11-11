@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Download, InfoFilled } from '@element-plus/icons-vue'
 import { useAppStore, cleanError } from '../stores/app'
+import { DEFAULT_UPDATE_FEED } from '../../electron/types'
 import type { AppSettings } from '../../electron/types'
 
 const props = defineProps<{ modelValue: boolean }>()
@@ -138,17 +139,22 @@ async function save() {
       <div class="field">
         <div class="label">
           <span>更新源</span>
-          <span class="hint">latest.json 的完整地址；留空则不检查更新</span>
+          <span class="hint">latest.json 的完整地址；清空 = 不检查更新</span>
         </div>
         <el-input
           v-model="settings.updateFeed"
           size="small"
           clearable
-          placeholder="https://example.com/thshell/latest.json"
+          placeholder="https://github.com/…/releases/latest/download/latest.json"
         />
         <div class="hint" style="margin-top: 6px">
-          支持 http/https 与 file://（共享盘）。生成 latest.json 用
-          <code class="mono">node scripts/make-manifest.mjs</code>。
+          默认走 GitHub Releases，发版时把 <code class="mono">latest.json</code> 和安装包传到 Release 即可。
+          内网机器可以换成自己的静态目录或共享盘（支持 http/https 与 file://）。
+        </div>
+        <div v-if="settings.updateFeed !== DEFAULT_UPDATE_FEED" class="hint" style="margin-top: 6px">
+          <el-button link type="primary" size="small" @click="settings.updateFeed = DEFAULT_UPDATE_FEED">
+            恢复官方 GitHub 源
+          </el-button>
         </div>
       </div>
     </div>

@@ -43,11 +43,27 @@ export interface AppSettings {
   copyOnSelect: boolean
   /**
    * 更新源：指向一个 latest.json 的完整 URL（支持 http/https 与 file://）。
-   * 留空 = 关闭检查更新 —— 内网工具不联网也能用，不该因为没配更新源就报错。
-   * 老配置里没有这个字段，`load()` 会用默认值 `''` 补齐。
+   *
+   * 默认值就是内置的 {{DEFAULT_UPDATE_FEED}}（GitHub Releases），装完即用。
+   * **留空 = 关掉检查更新** —— 内网机器完全不联网也能用，不该因为查不到更新就报错。
+   * 想彻底断网就把这一格清空，别只关弹窗。
    */
   updateFeed: string
 }
+
+/**
+ * 内置更新源。
+ *
+ * 用 GitHub Releases 的 `releases/latest/download/<文件名>` —— 这个地址**永远指向最新 release
+ * 的同名附件**，所以发版时不用改任何代码、不用固定 tag、也不用手动删旧文件：
+ * 打 tag → 传 latest.json 和安装包 → 客户端下次检查就看到了。
+ *
+ * 只对 **public 仓库**有效：private 仓库的 Release 附件匿名下载是 404。
+ * 国内直连 github.com 不稳时，在 latest.json 里给每个包配 `mirrors`，或直接把
+ * updateFeed 换成自建地址。
+ */
+export const DEFAULT_UPDATE_FEED =
+  'https://github.com/ElvisZhang0/ThShell/releases/latest/download/latest.json'
 
 /* ---------------- 检查更新 ---------------- */
 
@@ -59,7 +75,13 @@ export interface UpdateAsset {
   arch: string
   /** exe / dmg / zip / AppImage / deb / rpm / tar.gz */
   format: string
+  /** 主下载地址 */
   url: string
+  /**
+   * 备用镜像（**不含** url 本身），按顺序兜底。
+   * GitHub Release 在国内经常下不动，加个镜像前缀就能救回来 —— 改 JSON 即可，不用重新发版。
+   */
+  mirrors?: string[]
   /** 字节数，用来在下载前提示体积、下载后校验是否下全 */
   size?: number
   /** 小写十六进制；有就必须校验，防内网文件服务器上放错版本 */

@@ -14,12 +14,14 @@ import type { UpdateAsset, UpdateCheckResult, UpdateManifest, UpdateProgress } f
  *   1. 它只认 electron-builder 那套 latest.yml + Squirrel/NSIS，Linux 那边**只支持 AppImage**，
  *      而我们要发 deb / rpm（CentOS、麒麟这些机器上装的就是 rpm）；
  *   2. macOS 未签名时 Squirrel.Mac 直接拒绝，等于白搭；
- *   3. 我们的"更新源"就是一个静态目录，没必要为了它上 S3/GitHub。
+ *   3. 我们的"更新源"就是一个静态 JSON，二进制放哪儿都行。
  * 所以这里用最朴素的方案：一个 latest.json 描述"新版本有哪些包、在哪儿、sha256 多少"，
  * 客户端自己比对、自己下载、自己校验、自己拉起安装包。跨平台一致，也没有隐藏行为。
  *
- * 安全边界：更新源是用户自己配的（内网文件服务器 / 官网），
- * 我们只做 sha256 校验（配了就强制校验），不做签名验证 —— 没证书，做也做不了。
+ * 更新源不限于自建服务器 —— GitHub Releases 直接就能当源，见 types.ts 的
+ * DEFAULT_UPDATE_FEED。判断依据只有一条：那个 URL 能取到 latest.json。
+ *
+ * 安全边界：我们只做 sha256 校验（写了就强制校验），不做签名验证 —— 没证书，做也做不了。
  */
 
 /** 各平台优先下载哪种格式：越靠前越优先 */
@@ -60,11 +62,16 @@ export function parseManifest(raw: unknown): UpdateManifest {
   if (!Array.isArray(m.assets) || m.assets.length === 0) throw new Error('更新描述里没有 assets')
   const assets: UpdateAsset[] = m.assets.map((a, i) => {
     if (!a || typeof a.url !== 'string' || !a.url) throw new Error(`第 ${i + 1} 个包没有 url`)
+    // 镜像写坏了不该让整份描述作废：能用的留下，不能用的丢掉
+    const mirrors = Array.isArray(a.mirrors)
+      ? a.mirrors.filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
+      : undefined
     return {
       platform: String(a.platform || ''),
       arch: String(a.arch || ''),
       format: String(a.format || ''),
       url: a.url,
+      mirrors: mirrors && mirrors.length ? mirrors : undefined,
       size: typeof a.size === 'number' ? a.size : undefined,
       sha256: typeof a.sha256 === 'string' ? a.sha256.toLowerCase() : undefined
     }
@@ -76,7 +83,12 @@ export function parseManifest(raw: unknown): UpdateManifest {
 export function pickAsset(manifest: UpdateManifest): UpdateAsset | undefined {
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
   const candidates = manifest.assets.filter(
-    (a) => a.platform === process.platform && (a.arch === arch || !a.arch)
+    (a) =>
+      a.platform === process.platform &&
+      (a.arch === arch || !a.arch) &&
+      // 免安装版（portable）不能自我替换：拉起它只是又开一个实例，用户以为更新了其实没换。
+      // 所以永远不把它当更新包 —— 宁可报"没有可用的包"，也别给个装不上的。
+      a.format !== 'portable'
   )
   const order = FORMAT_PREFERENCE[process.platform] ?? []
   for (const format of order) {
@@ -104,7 +116,7 @@ async function readText(url: string, signal: AbortSignal): Promise<string> {
 export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> {
   const current = app.getVersion()
   const url = (feed || '').trim()
-  if (!url) return { current, hasUpdate: false, error: '还没有配置更新源' }
+  if (!url) return { current, hasUpdate: false, error: '没有配置更新源（留空即关闭检查更新）' }
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 15_000)
@@ -117,8 +129,15 @@ export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> 
       throw new Error('更新描述不是合法 JSON')
     }
     const manifest = parseManifest(raw)
-    // 相对路径按 feed 的位置解析：一个目录里放 latest.json 和安装包，写相对路径最省事
-    manifest.assets = manifest.assets.map((a) => ({ ...a, url: new URL(a.url, url).toString() }))
+    // 相对路径按 feed 的位置解析：一个目录里放 latest.json 和安装包，写相对路径最省事。
+    // 用 GitHub Releases 时这一条正好把 `ThShell-0.2.0-win-setup.exe` 解析成
+    // `.../releases/latest/download/ThShell-0.2.0-win-setup.exe` —— 不用写死域名。
+    const abs = (u: string) => new URL(u, url).toString()
+    manifest.assets = manifest.assets.map((a) => ({
+      ...a,
+      url: abs(a.url),
+      mirrors: a.mirrors?.map(abs)
+    }))
 
     const hasUpdate = compareVersions(manifest.version, current) > 0
     const asset = hasUpdate ? pickAsset(manifest) : undefined
@@ -128,14 +147,22 @@ export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> 
       hasUpdate,
       notes: manifest.notes,
       asset,
-      unsupported: hasUpdate && !asset ? `更新源里没有 ${process.platform}/${process.arch} 的安装包` : undefined
+      unsupported:
+        hasUpdate && !asset
+          ? `更新源里没有 ${process.platform}/${process.arch} 可自动更新的包（免安装版不算）`
+          : undefined
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
+    // GitHub 作为更新源时，失败十有八九是网络到不了 —— 别让用户对着 "fetch failed" 发呆
+    const onGitHub = /^https?:\/\/(www\.)?github\.com\//i.test(url)
+    const hint = onGitHub
+      ? '（GitHub 在国内经常连不上：可在「配置 → 更新源」换成自建地址，或在 latest.json 里给每个包加 mirrors）'
+      : ''
     return {
       current,
       hasUpdate: false,
-      error: controller.signal.aborted ? '连接更新源超时（15 秒）' : msg
+      error: (controller.signal.aborted ? '连接更新源超时（15 秒）' : msg) + hint
     }
   } finally {
     clearTimeout(timer)
@@ -166,24 +193,21 @@ function fileNameOf(url: string, format: string): string {
 }
 
 /**
- * 下载安装包到临时目录，边下边算 sha256。
- * 返回 null 表示被取消（用户点了取消，不算错误）。
+ * 从**一个**地址下载到 `<dest>.part`，校验通过后 rename 成正式文件。
+ * 失败一律抛出去，由外层决定是否换镜像。
  */
-export async function downloadUpdate(
+async function downloadOne(
+  url: string,
   asset: UpdateAsset,
-  onProgress: (p: UpdateProgress) => void
-): Promise<string | null> {
-  if (!/^https?:/i.test(asset.url)) throw new Error('只支持 http/https 下载地址')
-
-  const controller = new AbortController()
-  activeAbort = controller
-  const dest = path.join(tempDir(), fileNameOf(asset.url, asset.format))
+  dest: string,
+  onProgress: (p: UpdateProgress) => void,
+  controller: AbortController
+): Promise<void> {
   const part = dest + '.part'
-
   try {
-    const res = await net.fetch(asset.url, { signal: controller.signal })
-    if (!res.ok) throw new Error(`下载失败：服务器返回 ${res.status}`)
-    if (!res.body) throw new Error('下载失败：响应没有内容')
+    const res = await net.fetch(url, { signal: controller.signal })
+    if (!res.ok) throw new Error(`服务器返回 ${res.status}`)
+    if (!res.body) throw new Error('响应没有内容')
 
     const total = Number(res.headers.get('content-length') || asset.size || 0)
     const hash = crypto.createHash('sha256')
@@ -229,11 +253,51 @@ export async function downloadUpdate(
 
     fs.rmSync(dest, { force: true })
     fs.renameSync(part, dest)
-    return dest
   } catch (err) {
     fs.rmSync(part, { force: true })
-    if (controller.signal.aborted) return null
     throw err
+  }
+}
+
+/**
+ * 下载安装包到临时目录，边下边算 sha256。
+ * 返回 null 表示被取消（用户点了取消，不算错误）。
+ *
+ * 地址按 `[url, ...mirrors]` 依次尝试：GitHub Release 的附件国内经常连不上或者下到一半断，
+ * 配了镜像就不用等用户手动重试。只有全部失败才报错，并把每个源的失败原因都带上。
+ */
+export async function downloadUpdate(
+  asset: UpdateAsset,
+  onProgress: (p: UpdateProgress) => void
+): Promise<string | null> {
+  const urls = [asset.url, ...(asset.mirrors ?? [])].filter((u) => /^https?:/i.test(u))
+  if (!urls.length) throw new Error('只支持 http/https 下载地址')
+
+  const controller = new AbortController()
+  activeAbort = controller
+  const dest = path.join(tempDir(), fileNameOf(asset.url, asset.format))
+  const failures: string[] = []
+  let firstErr: unknown = null
+
+  try {
+    for (let i = 0; i < urls.length; i += 1) {
+      try {
+        await downloadOne(urls[i], asset, dest, onProgress, controller)
+        return dest
+      } catch (err) {
+        if (controller.signal.aborted) return null
+        if (!firstErr) firstErr = err
+        const msg = err instanceof Error ? err.message : String(err)
+        failures.push(`${i === 0 ? '主源' : `镜像 ${i}`}：${msg}`)
+        // 换源时进度归零，否则进度条会从上一份的百分比开始跳
+        if (i < urls.length - 1) {
+          onProgress({ transferred: 0, total: asset.size ?? 0, percent: 0, speed: 0 })
+        }
+      }
+    }
+    // 只有一个地址时别套"所有地址都失败"这层壳 —— 用户会纳闷"哪来的多个地址"
+    if (urls.length === 1 && firstErr instanceof Error) throw firstErr
+    throw new Error(`所有下载地址都失败了 —— ${failures.join('；')}`)
   } finally {
     activeAbort = null
   }

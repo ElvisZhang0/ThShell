@@ -79,8 +79,9 @@ const SHORTCUTS: Array<[string, string]> = [
           启动时也会静默查一次，有新版只在「关于」按钮上点一个小圆点，不弹窗打断你。
         </p>
         <p>
-          更新源要自己配：<strong>配置 → 更新</strong> 里填一个 <code class="mono">latest.json</code> 的地址。
-          留空就不检查 —— 内网机器不联网也能正常用。
+          更新源默认指向 <strong>GitHub Releases</strong>（<code class="mono">releases/latest/download/latest.json</code>），
+          不用自己搭服务器。想换的话在 <strong>配置 → 更新源</strong> 里改：内网机器可以指向共享盘或自己的静态目录。
+          那一格清空就不检查更新 —— 内网不联网也能正常用。
         </p>
       </section>
 

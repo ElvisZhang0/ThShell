@@ -12,7 +12,7 @@
 | --- | --- |
 | 连接管理 | 分组归类、密码/私钥两种认证、标签色标记环境、测试连接、配置导入导出 |
 | 菜单栏 | 标题栏左侧两项：**收起侧边栏**（`Ctrl+B`，收起后按钮变成「展开侧边栏」）和**关于**下拉 —— 里面是「关于 ThShell」（应用版本 + Electron / Chromium / Node 运行时版本）、「配置」、「检查更新」、「使用说明」。使用说明把连接、终端、文件、传输、弹窗五块的操作要点和快捷键表放在一页 |
-| 检查更新 | 「关于 → 检查更新」比对更新源里的 `latest.json`：有新版本就显示版本号与更新说明，下载带进度/速度，下载完做 **sha256 校验**（更新源里写了 sha256 就强制校验，防止内网文件服务器上放错版本），然后拉起安装包。启动时静默查一次 —— 有新版只在「关于」按钮上点一个圆点，不弹窗 |
+| 检查更新 | 「关于 → 检查更新」比对更新源里的 `latest.json`：有新版本就显示版本号与更新说明，下载带进度/速度，下载完做 **sha256 校验**（更新源里写了 sha256 就强制校验，防止内网文件服务器上放错版本），然后拉起安装包。启动时静默查一次 —— 有新版只在「关于」按钮上点一个圆点，不弹窗。**更新源默认走 GitHub Releases**（不用自己搭服务器），也能换成自建静态目录或共享盘；一个包可配多个镜像，主地址失败自动换 |
 | 终端 | xterm.js 多会话标签，256 色、滚屏 8000 行、`Ctrl+F` 搜索；底部快捷命令条：7 条常驻一键 + 35 条运维命令分组浮层，悬停看说明 |
 | SFTP | 本地/远程双栏，单文件与**目录递归下载**（带进度与失败清单），远程文件内置编辑器（UTF-8 / UTF-16 按原编码读写），本地删除走系统回收站 |
 | 远程列表 | 多两列：**权限**（`rw-r--r--`，带 setuid/setgid/sticky 的 `s/S/t/T`）和 **用户 / 组**（`root:root`）；**当前 SSH 用户写不了的整串权限标红**（算的是真实 uid/gid，不是用户名），悬停能看到"为什么红"；窗口变窄时按栏宽先收属主列、再收权限列，不挤文件名 |
@@ -52,7 +52,8 @@ pnpm dist         # 构建并用 electron-builder 出安装包（release/）
 | Windows x64 | `pnpm dist:win` | Windows 本机 | `ThShell-0.1.0-win-setup.exe`（安装版）<br>`ThShell-0.1.0-win-portable.exe`（免安装单文件） |
 | Linux x64 | `pnpm dist:linux` | Linux 本机；Windows / macOS 上自动转 Docker | `.AppImage` / `.deb` / `.rpm` / `.tar.gz` |
 | macOS x64 + arm64 | `pnpm dist:mac` | **只能 macOS** | `-mac-x64.dmg`、`-mac-arm64.dmg`、对应 `.zip` |
-| 三平台一起 | GitHub Actions 手动触发，或推 `v*` tag | 云端 | 见 `.github/workflows/build-desktop.yml` |
+| 三平台一起 | GitHub Actions 手动触发 | 云端，只出 artifact | 见 `.github/workflows/build-desktop.yml` |
+| **发版（带自动更新）** | `git tag v0.2.0 && git push origin v0.2.0` | 云端 | 三平台包 + GitHub Release + `latest.json` 全自动 |
 
 配置集中在 `electron-builder.yml`（不再塞在 `package.json` 的 `build` 字段里）。
 
@@ -99,7 +100,20 @@ Linux 上以 root 运行会因 Chromium 沙箱报错，需要加 `--no-sandbox`�
 
 ### 发一版（带检查更新）
 
-发版比原来多一步：生成 `latest.json`。客户端只认这个文件。
+发版比原来多一步：生成 `latest.json`，然后把 `latest.json` 和安装包一起传到 **GitHub Release**。
+
+客户端默认就去 GitHub Releases 找更新（`releases/latest/download/latest.json`），不用自己搭任何服务器。
+`releases/latest/download/<文件名>` 这个地址**永远指向最新 release 的同名附件** —— 所以发版时不用改代码、
+不用固定 tag，也不用往旧 release 里覆盖文件。
+
+**最省事的方式：打个 tag 推上去，剩下的 CI 全干**（`build-desktop.yml` 的 `manifest` job 会等三个平台
+打完，下载全部产物，跑一遍 `make-manifest --gh`，再把 `latest.json` 补传进同一个 Release）：
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+本地手动发版则是：
 
 ```bash
 # 1) 打包（三个平台各跑各的，产物都进 release/）
@@ -108,13 +122,28 @@ pnpm dist:linux
 pnpm dist:mac
 
 # 2) 生成更新描述：扫描 release/，算 sha256 与字节数
-pnpm manifest --notes "1. 新增检查更新
+#    --gh 让每个包的 url 直接写成 releases/latest/download/ 形式
+pnpm manifest:gh --notes "1. 新增检查更新
 2. 修复文件列表权限列误判"
 
-# 3) 把 latest.json 和所有安装包丢进同一个静态目录
-#    （nginx / 对象存储 / 共享盘都行），然后把它的地址填进
-#    「配置 → 更新源」，例如 https://dl.example.com/thshell/latest.json
+# 3) 传到 GitHub Release（附件名要和 JSON 里的一致）
+gh release create v0.2.0 latest.json release/ThShell-* --notes "0.2.0"
 ```
+
+两个前提，缺了客户端就查不到：
+
+- **仓库必须是 public**。private 仓库的 Release 附件匿名下载一律 404，客户端没有你的凭据。
+- **Release 不能勾 Pre-release**。`releases/latest` 只认正式版，勾了就取不到。
+
+镜像（国内直连 GitHub 经常下不动，可选）：
+
+```bash
+# 给每个包配一个加速前缀，客户端主地址失败会自动按顺序试镜像
+pnpm manifest:gh --mirror https://ghfast.top/ --notes "..."
+```
+
+生成出来的 `mirrors` 是「前缀 + 主地址」，例如
+`https://ghfast.top/https://github.com/ElvisZhang0/ThShell/releases/latest/download/ThShell-0.2.0-win-setup.exe`。
 
 `latest.json` 长这样（`assets` 是按 平台 + 架构 + 格式 列的，客户端自己挑本机该装的那个）：
 
@@ -126,6 +155,7 @@ pnpm manifest --notes "1. 新增检查更新
   "assets": [
     { "platform": "win32", "arch": "x64", "format": "exe",
       "url": "ThShell-0.2.0-win-setup.exe",
+      "mirrors": ["https://ghfast.top/https://github.com/…/ThShell-0.2.0-win-setup.exe"],
       "size": 103833304, "sha256": "e913629f…" }
   ]
 }
@@ -133,11 +163,14 @@ pnpm manifest --notes "1. 新增检查更新
 
 几个要点：
 
-- **`url` 可以写相对路径**，客户端会按 `latest.json` 自己的地址解析 —— 换域名、挪目录都不用重新生成；
-  加 `--base https://dl.example.com/thshell/` 则直接写成绝对地址。
+- **`url` 可以写相对路径**，客户端会按 `latest.json` 自己的地址解析 —— 换域名、挪目录都不用重新生成。
+  用 `--gh` / `--base` 时写绝对地址；`mirrors` 也按同样的规则解析，所以相对路径 + 前缀就能完整拼出来。
+- **下载地址有多个候选**：主地址失败（404、超时、断流）自动换 `mirrors` 里的下一个，全挂才报错，
+  并且把每个源失败的原因都列出来。
 - **`sha256` 写了就强制校验**，对不上直接拒绝安装。内网文件服务器上放错版本、传一半断了，都靠它兜底。
 - 客户端优先选 `exe` / `dmg` / `AppImage`，所以 deb、rpm、portable 这些"备胎"同时在库里也不冲突。
-- 更新源留空 = 完全不检查更新（内网机器不联网也能正常用）。
+- **更新源那格清空 = 完全不检查更新**（内网机器不联网也能正常用）。默认值就是内置的 GitHub 地址，
+  换成自建目录只是改一个字符串。
 
 **各平台"安装"能做到什么程度**：
 
@@ -687,16 +720,29 @@ $env:THSHELL_SMOKE="quick"; pnpm exec electron .
   - 它只认 electron-builder 那套 `latest.yml`，**Linux 那边只支持 AppImage** —— 而 CentOS / 麒麟
     上装的是 rpm，deb 同理，等于一半用户漏掉；
   - macOS 未签名时 Squirrel.Mac 直接拒绝，做不了；
-  - 我们的"更新源"就是一个静态目录，没必要为它上 S3 或 GitHub Releases。
+  - 我们要的只是"版本号 + 几个包的地址 + 校验和"，用不着它那套差分/渠道/blockmap。
   于是方案退到最朴素的形态：一个 `latest.json` 说清"新版本有哪些包、在哪儿、sha256 多少"，
   客户端自己比对、自己下载、自己校验、自己拉起安装包。跨平台一致，也没有隐藏行为。
+  - **更新源放在哪儿都行，默认就是 GitHub Releases**。关键是 URL 形态：用
+    `releases/latest/download/<文件名>`，这个地址永远指向**最新 release 的同名附件**，
+    所以发版不用改代码、不用固定 tag、不用往旧 release 里覆盖文件。
+    代价只有两条：仓库得是 public（private 的附件匿名下载 404），Release 不能勾 Pre-release。
+  - 同样因为只认 URL，自建 nginx / 共享盘 / 对象存储随时可以顶上 —— 换源就是改一个字符串，
+    内网机器把这个字符串清空就彻底不联网检查。
   - 版本比较自己写（`0.10.0 > 0.9.9`）：字符串比较会把 `0.10.0` 判成小于 `0.9.9`，这是最经典的坑。
   - `url` 支持相对路径，用 `new URL(url, feed)` 解析 —— 一个目录里放 json 和安装包最省事，
-    换域名也不用重新生成。
+    换域名也不用重新生成。**GitHub 场景下这一条顺手解决了绝对地址**：
+    相对的文件名会解析成 `.../releases/latest/download/<文件名>`。
+  - **`mirrors` 做多源兜底**：GitHub 的附件在 `objects.githubusercontent.com`，国内经常 404 或断流。
+    `[url, ...mirrors]` 依次尝试，一个源失败自动换下一个，全挂才报错并把每个源的失败原因列出来；
+    换源时进度条归零，否则会从上一份的百分比开始跳。
   - 下载用 `net.fetch` 而不是 Node 的 `https`：前者走 Chromium 的网络栈，**自动带上系统代理**，
-    内网环境经常是必须的。
+    内网环境经常是必须的。GitHub 的附件下载会 302 到 `objects.githubusercontent.com`，
+    `net.fetch` 自己跟重定向，不用额外处理。
   - 边下边算 sha256，`content-length` 与 `size` 双重校验，写 `.part` 再 rename —— 半截文件不会被当成安装包。
   - 启动时的静默检查**只点一个圆点，不弹窗**：用的是运维的机器，弹窗打断比漏更新更烦。
+  - 连不上 GitHub 时错误信息会点明这一步（"GitHub 在国内经常连不上…"），
+    否则用户只看到 `fetch failed`，不知道该去改更新源。
 
 ## 已知限制
 

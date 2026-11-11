@@ -69,6 +69,7 @@ import {
   renameLocal,
   writeLocalFile
 } from './modules/local-fs'
+import { DEFAULT_UPDATE_FEED } from './types'
 import type { AppInfo, FileEntry, PasteMode, ServerConfig, TransferProgress, UpdateAsset } from './types'
 import type { TextEncoding } from './modules/text-guard'
 
@@ -3219,7 +3220,11 @@ function createWindow(): void {
         const format =
           process.platform === 'win32' ? 'exe' : process.platform === 'darwin' ? 'dmg' : 'deb'
 
-        const manifestOf = (version: string, sha: string) => ({
+        const manifestOf = (
+          version: string,
+          sha: string,
+          extra: { url?: string; mirrors?: string[] } = {}
+        ) => ({
           version,
           publishedAt: new Date().toISOString(),
           notes: '1. 新增检查更新\n2. 修复若干问题',
@@ -3229,7 +3234,8 @@ function createWindow(): void {
               arch,
               format,
               // 故意用相对路径：客户端要能按 latest.json 的位置解析出来
-              url: `files/ThShell-${version}-${process.platform}.${format}`,
+              url: extra.url ?? `files/ThShell-${version}-${process.platform}.${format}`,
+              mirrors: extra.mirrors,
               size: payload.length,
               sha256: sha
             }
@@ -3255,6 +3261,32 @@ function createWindow(): void {
           }
           if (url === '/broken.json') {
             res.end('{ 这不是 JSON')
+            return
+          }
+          // 主地址不存在、镜像好用 —— 测换源兜底（GitHub 下不动时的真实场景）
+          if (url === '/mirror.json') {
+            res.setHeader('content-type', 'application/json')
+            res.end(
+              JSON.stringify(
+                manifestOf('9.9.9', goodSha, {
+                  url: 'gone/ThShell-missing.bin',
+                  mirrors: [`files/ThShell-9.9.9-${process.platform}.${format}`]
+                })
+              )
+            )
+            return
+          }
+          // 主地址和镜像全挂 —— 报错里要说清楚每一个源都试过了
+          if (url === '/allgone.json') {
+            res.setHeader('content-type', 'application/json')
+            res.end(
+              JSON.stringify(
+                manifestOf('9.9.9', goodSha, {
+                  url: 'gone/a.bin',
+                  mirrors: ['gone/b.bin']
+                })
+              )
+            )
             return
           }
           if (url.startsWith('/files/')) {
@@ -3329,6 +3361,57 @@ function createWindow(): void {
           shapeErr = err instanceof Error ? err.message : String(err)
         }
         push('缺字段的 manifest 被拒绝', shapeErr.includes('version'), shapeErr)
+
+        // 8. 内置更新源指向 GitHub Releases 的固定地址
+        push(
+          '默认源指向 releases/latest/download',
+          DEFAULT_UPDATE_FEED.endsWith('/releases/latest/download/latest.json'),
+          DEFAULT_UPDATE_FEED
+        )
+
+        // 免安装版不能当更新包：拉起它只是又开一个实例，用户以为更新了其实没换
+        const portablePick = pickAsset(
+          parseManifest({
+            version: '9.9.9',
+            assets: [{ platform: process.platform, arch, format: 'portable', url: 'a.exe' }]
+          })
+        )
+        push('免安装版不会被当成更新包', !portablePick, portablePick ? portablePick.format : '已排除')
+
+        // 9. 镜像兜底：GitHub 下不动时靠它 —— 主地址 404 要自动换 mirrors
+        const mirrored = await checkForUpdates(`${base}/mirror.json`)
+        push(
+          '镜像地址也按相对路径解析',
+          !!mirrored.asset?.mirrors?.length && mirrored.asset.mirrors[0].startsWith(base),
+          mirrored.asset?.mirrors?.[0] ?? '无'
+        )
+        let mirrorFile: string | null = null
+        let mirrorErr = ''
+        if (mirrored.asset) {
+          try {
+            mirrorFile = await downloadUpdate(mirrored.asset, () => {})
+          } catch (err) {
+            mirrorErr = err instanceof Error ? err.message : String(err)
+          }
+        }
+        const mirrorSize = mirrorFile && fs.existsSync(mirrorFile) ? fs.statSync(mirrorFile).size : -1
+        push('主源 404 时自动换镜像下完', mirrorSize === payload.length, mirrorErr || `${mirrorSize} 字节`)
+
+        // 10. 全挂时要把每个源的失败原因都带出来，别只说"下载失败"
+        const allGone = await checkForUpdates(`${base}/allgone.json`)
+        let allErr = ''
+        if (allGone.asset) {
+          try {
+            await downloadUpdate(allGone.asset, () => {})
+          } catch (err) {
+            allErr = err instanceof Error ? err.message : String(err)
+          }
+        }
+        push(
+          '所有源都失败时逐个说明',
+          allErr.includes('所有下载地址') && allErr.includes('主源'),
+          allErr.slice(0, 70)
+        )
 
         server.close()
 

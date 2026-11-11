@@ -1,8 +1,13 @@
 name: build-desktop
 
 # 什么时候跑：
-#   1. 手动点（Actions → build-desktop → Run workflow）—— 平时发版用这个
-#   2. 打 tag（v0.1.0）—— 顺手把产物挂到 Release 上
+#   1. 手动点（Actions → build-desktop → Run workflow）—— 只出 artifact，不发版
+#   2. 打 tag（v0.1.0）—— 出三平台包 + 建 Release + 自动生成 latest.json 补传
+#
+# 发版只要一条命令：
+#   git tag v0.2.0 && git push origin v0.2.0
+# 之后装在用户机器上的旧版就能通过「关于 → 检查更新」看到这一版。
+# 前提：仓库是 public（private 的 Release 附件匿名下载 404），且不要勾 Pre-release。
 on:
   workflow_dispatch:
   push:
@@ -85,3 +90,43 @@ jobs:
             release/*.deb
             release/*.rpm
             release/*.tar.gz
+
+  # 三个平台都打完之后，汇总生成本周版本的 latest.json 补传上去。
+  # 客户端只认这一个文件：releases/latest/download/latest.json
+  # 少了它，装在用户机器上的旧版就永远查不到新版本。
+  manifest:
+    name: 生成 latest.json
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 把三个平台的产物平铺到 release/ —— make-manifest 按文件名判断平台和格式
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: 生成 latest.json
+        run: |
+          node scripts/make-manifest.mjs \
+            --gh "${{ github.repository }}" \
+            --out release/latest.json \
+            --notes "ThShell ${GITHUB_REF_NAME#v}"
+
+      - name: 补传到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" release/latest.json --clobber
+
+      # 把清单也留一份在 artifact 里，出问题时不用去翻 Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ThShell-manifest
+          path: release/latest.json
+          retention-days: 30
