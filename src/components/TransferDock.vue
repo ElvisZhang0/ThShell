@@ -342,9 +342,11 @@ onMounted(() => {
   transform: rotate(180deg);
 }
 
-/* 展开后给个上限：传了 20 个文件也不该把终端挤成一条缝 */
+/* 展开后给个上限：传了 20 个文件也不该把终端挤成一条缝。
+ * 260px 是按"三条进行中 + 一条历史刚好不滚动"标定的（冒烟里有断言）；
+ * 行内的控制按钮从 16px 放大到 22px 之后，每行高 6px，这里跟着加了 28px。 */
 .dock-list {
-  max-height: 232px;
+  max-height: 260px;
   overflow-y: auto;
   padding: 2px 12px 8px;
   border-top: 1px solid var(--border-soft);
@@ -490,32 +492,32 @@ onMounted(() => {
 /*
  * 行内的暂停 / 取消按钮。
  * 常驻显示而不是 hover 才出现：传输区本来就只有几行，"要传完了才发现能暂停"
- * 比"稍微占点地方"更糟。做成无边框图标，视觉上不会盖过进度条。
+ * 比"稍微占点地方"更糟。
+ *
+ * 尺寸按 22×22 做：这是一天要点好几次的动作，16px 的图标框太小，
+ * 鼠标得瞄着点，误点还会点到旁边的进度条上。
+ * 代价是每行高 6px，面板的 max-height 跟着从 232 提到 260（见 .dock-list）。
  */
 .ctl {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   margin-left: auto;
   flex: 0 0 auto;
-  /*
-   * 高度必须压在 16px：面板的高度是按"四行刚好装得下"标定的（冒烟里有断言），
-   * 按钮做成 20px 就会把每行顶高 5px，四行累计 20px，直接多出一条滚动条。
-   */
-  height: 16px;
+  height: 22px;
 }
 
 .c-btn {
-  width: 16px;
-  height: 16px;
+  width: 22px;
+  height: 22px;
   display: flex;
   align-items: center;
   justify-content: center;
   border: none;
-  border-radius: 4px;
+  border-radius: 5px;
   background: transparent;
-  color: var(--text-3);
-  font-size: 10px;
+  color: var(--text-2);
+  font-size: 13px;
   cursor: pointer;
   padding: 0;
 }
