@@ -40,6 +40,15 @@ import {
 } from './modules/sftp-service'
 import { copyLocal, moveLocal, pasteRemote } from './modules/file-ops'
 import {
+  cancelDownload,
+  checkForUpdates,
+  compareVersions,
+  downloadUpdate,
+  installUpdate,
+  parseManifest,
+  pickAsset
+} from './modules/updater'
+import {
   appendTransfer,
   clearTransferLog,
   loadTransferLog,
@@ -60,7 +69,7 @@ import {
   renameLocal,
   writeLocalFile
 } from './modules/local-fs'
-import type { AppInfo, FileEntry, PasteMode, ServerConfig, TransferProgress } from './types'
+import type { AppInfo, FileEntry, PasteMode, ServerConfig, TransferProgress, UpdateAsset } from './types'
 import type { TextEncoding } from './modules/text-guard'
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
@@ -1549,9 +1558,10 @@ function createWindow(): void {
           })()`)
 
         let ui = (await readDlg()) as Record<string, any>
-        // 滚动这条要留出测量的时间：弹窗刚挂上时 CodeMirror 的 scrollHeight 还没算完，
-        // 差值和阈值只差几像素，偶发假失败（内容其实已经到底了）。量两次，任一次到底就算过。
-        if (ui.atBottom !== true) {
+        // 滚动这条要留出测量的时间：弹窗刚挂上时 CodeMirror 的 scrollHeight 还在长，
+        // 差值和阈值只差几像素就会偶发假失败（内容其实已经到底了）。
+        // 最多轮询 2.5 秒，一旦到底立刻停 —— 只重试一次是不够的，日志是边读边渲染的。
+        for (let i = 0; i < 5 && ui.atBottom !== true; i += 1) {
           await wait(500)
           ui = { ...ui, ...((await readDlg()) as Record<string, any>) }
         }
@@ -3194,6 +3204,172 @@ function createWindow(): void {
         return
       }
 
+      // update 模式：检查更新。
+      // 在本机起一个临时 HTTP 服务当"更新源"，把 有新版本 / 已是最新 / JSON 坏了 / 404 /
+      // 校验和对不上 这几条路都走一遍。不依赖外网，也不碰用户真实的配置文件。
+      if (mode === 'update') {
+        await wait(800)
+        const http = await import('node:http')
+        const cryptoMod = await import('node:crypto')
+
+        // 假装是个 80KB 的安装包
+        const payload = cryptoMod.randomBytes(80 * 1024)
+        const goodSha = cryptoMod.createHash('sha256').update(payload).digest('hex')
+        const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+        const format =
+          process.platform === 'win32' ? 'exe' : process.platform === 'darwin' ? 'dmg' : 'deb'
+
+        const manifestOf = (version: string, sha: string) => ({
+          version,
+          publishedAt: new Date().toISOString(),
+          notes: '1. 新增检查更新\n2. 修复若干问题',
+          assets: [
+            {
+              platform: process.platform,
+              arch,
+              format,
+              // 故意用相对路径：客户端要能按 latest.json 的位置解析出来
+              url: `files/ThShell-${version}-${process.platform}.${format}`,
+              size: payload.length,
+              sha256: sha
+            }
+          ]
+        })
+
+        const server = http.createServer((req, res) => {
+          const url = (req.url || '/').split('?')[0]
+          if (url === '/new.json') {
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify(manifestOf('9.9.9', goodSha)))
+            return
+          }
+          if (url === '/same.json') {
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify(manifestOf(app.getVersion(), goodSha)))
+            return
+          }
+          if (url === '/badsha.json') {
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify(manifestOf('9.9.9', '0'.repeat(64))))
+            return
+          }
+          if (url === '/broken.json') {
+            res.end('{ 这不是 JSON')
+            return
+          }
+          if (url.startsWith('/files/')) {
+            res.setHeader('content-type', 'application/octet-stream')
+            res.setHeader('content-length', String(payload.length))
+            res.end(payload)
+            return
+          }
+          res.statusCode = 404
+          res.end('not found')
+        })
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+        const port = (server.address() as { port: number }).port
+        const base = `http://127.0.0.1:${port}`
+
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        // 1. 版本比较：字符串比较会把 0.10 判成小于 0.9
+        push('0.10.0 > 0.9.9', compareVersions('0.10.0', '0.9.9') === 1)
+        push('0.1.0 = v0.1.0', compareVersions('v0.1.0', '0.1.0') === 0)
+        push('0.1.0 < 0.1.1', compareVersions('0.1.0', '0.1.1') === -1)
+
+        // 2. 有新版本
+        const newer = await checkForUpdates(`${base}/new.json`)
+        push('查到新版本', newer.hasUpdate && newer.latest === '9.9.9', `${newer.current} → ${newer.latest ?? '无'}`)
+        push('挑出了本平台的包', !!newer.asset, newer.asset ? `${newer.asset.platform}/${newer.asset.arch}/${newer.asset.format}` : '无')
+        push('相对地址解析成了绝对地址', !!newer.asset?.url.startsWith(base), newer.asset?.url ?? '')
+
+        // 3. 已是最新
+        const same = await checkForUpdates(`${base}/same.json`)
+        push('同版本时判定为已是最新', !same.hasUpdate && !same.error, same.latest ?? '')
+
+        // 4. 更新源写坏了
+        const broken = await checkForUpdates(`${base}/broken.json`)
+        push('JSON 坏掉时给出可读的错误', !!broken.error, broken.error ?? '无')
+        const missing = await checkForUpdates(`${base}/nope.json`)
+        push('404 时把状态码带出来', (missing.error ?? '').includes('404'), missing.error ?? '无')
+        const empty = await checkForUpdates('')
+        push('没配更新源时提示去配置', (empty.error ?? '').includes('没有配置'), empty.error ?? '无')
+
+        // 5. 下载 + 校验和
+        let lastPercent = 0
+        const file = newer.asset
+          ? await downloadUpdate(newer.asset, (p) => {
+              lastPercent = p.percent
+            })
+          : null
+        const size = file && fs.existsSync(file) ? fs.statSync(file).size : -1
+        push('下载完成且大小一致', size === payload.length, `${size} 字节`)
+        push('下载过程有进度上报', lastPercent > 0, `${lastPercent}%`)
+        const got = file ? cryptoMod.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : ''
+        push('sha256 与更新源一致', got === goodSha, got.slice(0, 12))
+
+        // 6. 校验和对不上时必须拒绝（内网文件服务器放错版本就靠它兜底）
+        const bad = await checkForUpdates(`${base}/badsha.json`)
+        let badErr = ''
+        if (bad.asset) {
+          try {
+            await downloadUpdate(bad.asset, () => {})
+          } catch (err) {
+            badErr = err instanceof Error ? err.message : String(err)
+          }
+        }
+        push('校验不通过时拒绝安装包', badErr.includes('校验'), badErr || '没有报错')
+
+        // 7. 结构校验：少 version 的 manifest 要当场说清楚
+        let shapeErr = ''
+        try {
+          parseManifest({ assets: [] })
+        } catch (err) {
+          shapeErr = err instanceof Error ? err.message : String(err)
+        }
+        push('缺字段的 manifest 被拒绝', shapeErr.includes('version'), shapeErr)
+
+        server.close()
+
+        // 8. 界面上「检查更新」能打开（没配更新源时应该是引导去配置，而不是空白）
+        await wait(400)
+        await js(`document.querySelectorAll('.menubar .el-dropdown .mb')[0]?.click()`)
+        await wait(600)
+        const items = (await js(
+          `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')].map((i) => i.textContent.trim())`
+        )) as string[]
+        push('下拉里有「检查更新」', items.some((t) => t.includes('检查更新')), items.join(' | '))
+
+        await js(
+          `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')]
+            .find((i) => i.textContent.includes('检查更新'))?.click()`
+        )
+        await wait(1500)
+        // 取"最后打开的那个可见弹窗"的正文：比按标题匹配稳，
+        // 弹窗的标题节点在 Element Plus 各版本里位置不一样
+        const dlgText = (await js(`(() => {
+          const ds = [...document.querySelectorAll('.el-dialog')]
+            .filter((el) => el.getBoundingClientRect().width > 0)
+          const d = ds[ds.length - 1]
+          return d ? (d.textContent || '').trim() : ''
+        })()`)) as string
+        push('弹窗打开了', dlgText.length > 0, dlgText.slice(0, 40))
+        push('没配更新源时给出引导而不是空白', dlgText.includes('更新源'), dlgText.slice(0, 60))
+        await shot('thshell-update.png')
+        await js(`[...document.querySelectorAll('.el-dialog')]
+          .filter((el) => el.getBoundingClientRect().width > 0)
+          .pop()?.querySelector('.el-dialog__headerbtn')?.click()`)
+
+        for (const [name, ok, detail] of checks) {
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        const badCount = checks.filter((c) => !c[1]).length
+        console.log(`[smoke] update ${badCount ? badCount + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+        finish()
+        return
+      }
+
       // bar 模式：标题栏菜单栏（收起侧边栏 + 关于下拉里的 关于/配置/使用说明）。
       // 这组不依赖 SSH —— 侧边栏和三个弹窗都跟服务器状态无关，所以能独立跑，
       // 连不上测试机时也能拿它验界面。
@@ -3271,8 +3447,12 @@ function createWindow(): void {
         const menuItems = (await js(
           `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')].map((i) => i.textContent.trim())`
         )) as string[]
-        push('下拉有三项', menuItems.length === 3, menuItems.join(' | '))
-        push('三项是 关于 / 配置 / 使用说明', menuItems.join('|') === '关于 ThShell|配置|使用说明', menuItems.join('|'))
+        push('下拉有四项', menuItems.length === 4, menuItems.join(' | '))
+        push(
+          '四项是 关于 / 配置 / 检查更新 / 使用说明',
+          menuItems.join('|') === '关于 ThShell|配置|检查更新|使用说明',
+          menuItems.join('|')
+        )
         await shot('thshell-bar-about.png')
 
         await clickMenu('配置')
@@ -4022,4 +4202,16 @@ function registerIpc(): void {
     mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize()
   })
   ipcMain.on('app:close', () => mainWindow?.close())
+
+  // ---------- 检查更新 ----------
+  register('update:check', (feed: string) => checkForUpdates(feed))
+  register('update:download', async (asset: UpdateAsset) => {
+    const filePath = await downloadUpdate(asset, (progress) => {
+      mainWindow?.webContents.send('update:progress', progress)
+    })
+    // null = 用户取消，不是错误
+    return filePath ? { path: filePath } : null
+  })
+  ipcMain.on('update:cancel', () => cancelDownload())
+  register('update:install', (filePath: string) => installUpdate(filePath))
 }

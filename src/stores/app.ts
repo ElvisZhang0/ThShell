@@ -52,7 +52,8 @@ const EMPTY_CONFIG: AppConfig = {
     theme: 'dark',
     fontSize: 14,
     metricInterval: 3000,
-    copyOnSelect: true
+    copyOnSelect: true,
+    updateFeed: ''
   }
 }
 
@@ -125,7 +126,8 @@ export const useAppStore = defineStore('app', {
             theme: s.theme ?? s.terminalTheme ?? 'dark',
             fontSize: s.fontSize ?? 14,
             metricInterval: s.metricInterval ?? 3000,
-            copyOnSelect: s.copyOnSelect ?? true
+            copyOnSelect: s.copyOnSelect ?? true,
+            updateFeed: s.updateFeed ?? ''
           }
         }
       } catch (err) {

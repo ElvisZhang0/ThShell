@@ -473,3 +473,12 @@ textarea {
   min-width: 132px;
   font-size: 12.5px;
 }
+
+/* 「检查更新」那行右边的小圆点：下拉项是 flex，用 margin-left:auto 顶到最右 */
+.tb-dropdown .dot {
+  margin-left: auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}

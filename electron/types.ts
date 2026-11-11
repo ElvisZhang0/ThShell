@@ -44,8 +44,9 @@ export interface AppSettings {
   /**
    * 更新源：指向一个 latest.json 的完整 URL（支持 http/https 与 file://）。
    * 留空 = 关闭检查更新 —— 内网工具不联网也能用，不该因为没配更新源就报错。
+   * 老配置里没有这个字段，`load()` 会用默认值 `''` 补齐。
    */
-  updateFeed?: string
+  updateFeed: string
 }
 
 /* ---------------- 检查更新 ---------------- */

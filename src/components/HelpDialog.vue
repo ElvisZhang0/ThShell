@@ -72,7 +72,20 @@ const SHORTCUTS: Array<[string, string]> = [
       </section>
 
       <section>
-        <h4>6 · 快捷键</h4>
+        <h4>6 · 检查更新</h4>
+        <p>
+          「关于 → 检查更新」会去更新源比对版本。有新版本时可以看到更新说明、下载（带进度和速度），
+          下载完点「安装」拉起安装包 —— Windows 上是真正的一键安装，Linux 的 deb/rpm 会给出安装命令。
+          启动时也会静默查一次，有新版只在「关于」按钮上点一个小圆点，不弹窗打断你。
+        </p>
+        <p>
+          更新源要自己配：<strong>配置 → 更新</strong> 里填一个 <code class="mono">latest.json</code> 的地址。
+          留空就不检查 —— 内网机器不联网也能正常用。
+        </p>
+      </section>
+
+      <section>
+        <h4>7 · 快捷键</h4>
         <table class="keys">
           <tbody>
             <tr v-for="[key, desc] in SHORTCUTS" :key="key">

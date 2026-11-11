@@ -9,7 +9,8 @@ import type {
   SystemInfo,
   ThShellApi,
   TransferProgress,
-  TransferRecord
+  TransferRecord,
+  UpdateProgress
 } from './types'
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -123,6 +124,13 @@ const api: ThShellApi = {
     minimize: () => ipcRenderer.send('app:minimize'),
     toggleMaximize: () => ipcRenderer.send('app:toggleMaximize'),
     close: () => ipcRenderer.send('app:close')
+  },
+  update: {
+    check: (feed: string) => ipcRenderer.invoke('update:check', feed),
+    download: (asset) => ipcRenderer.invoke('update:download', asset),
+    cancel: () => ipcRenderer.send('update:cancel'),
+    install: (filePath: string) => ipcRenderer.invoke('update:install', filePath),
+    onProgress: (cb) => subscribe<UpdateProgress>('update:progress', cb)
   },
   docker: {
     probe: (sessionId: string) => ipcRenderer.invoke('docker:probe', sessionId),

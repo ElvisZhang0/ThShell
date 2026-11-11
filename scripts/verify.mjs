@@ -29,7 +29,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const electronPath = require('electron')
 
 /** 改完代码必须过一遍的几组：都自带数据准备，不依赖机器上有什么文件 */
-const CORE = ['bar', 'text', 'log', 'pdf', 'edit', 'tips', 'icons', 'perm']
+const CORE = ['bar', 'update', 'text', 'log', 'pdf', 'edit', 'tips', 'icons', 'perm']
 /** 布局 / 视觉类：只在动了对应区域时带上，跑得慢（每组 ~10s） */
 const LAYOUT = ['foot', 'menu', 'jump', 'transfer', 'clip', 'tabs', 'quick', 'monitor', 'sys']
 const ALL = [...CORE, ...LAYOUT]

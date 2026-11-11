@@ -134,6 +134,26 @@ async function save() {
     </div>
 
     <div class="section">
+      <div class="section-title">更新</div>
+      <div class="field">
+        <div class="label">
+          <span>更新源</span>
+          <span class="hint">latest.json 的完整地址；留空则不检查更新</span>
+        </div>
+        <el-input
+          v-model="settings.updateFeed"
+          size="small"
+          clearable
+          placeholder="https://example.com/thshell/latest.json"
+        />
+        <div class="hint" style="margin-top: 6px">
+          支持 http/https 与 file://（共享盘）。生成 latest.json 用
+          <code class="mono">node scripts/make-manifest.mjs</code>。
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
       <div class="section-title">数据</div>
       <div class="field row">
         <div class="label">

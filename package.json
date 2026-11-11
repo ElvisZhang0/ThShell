@@ -16,7 +16,8 @@
     "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win --x64",
     "dist:linux": "node scripts/build-linux.mjs",
-    "dist:mac": "npm run build && electron-builder --mac --x64 --arm64"
+    "dist:mac": "npm run build && electron-builder --mac --x64 --arm64",
+    "manifest": "node scripts/make-manifest.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",

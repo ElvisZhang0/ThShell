@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ArrowDown, Expand, Fold, Plus, Setting, Upload } from '@element-plus/icons-vue'
+import { computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAppStore, cleanError } from '../stores/app'
+import { updateState } from '../utils/update-state'
 import LogoMark from './LogoMark.vue'
 
 const props = defineProps<{ collapsed: boolean }>()
@@ -12,14 +14,19 @@ const emit = defineEmits<{
   (e: 'toggle-sidebar'): void
   (e: 'open-about'): void
   (e: 'open-help'): void
+  (e: 'open-update'): void
 }>()
 
 const store = useAppStore()
 
-/** 「关于」下拉的三项：关于 / 配置 / 使用说明 —— 归到一个菜单里比在标题栏再摆三个图标省地方 */
+/** 启动时的静默检查查到了新版本 → 「关于」按钮上点一个小圆点 */
+const hasUpdate = computed(() => !!updateState.result?.hasUpdate)
+
+/** 「关于」下拉的四项：关于 / 配置 / 检查更新 / 使用说明 */
 function onMenu(command: string | number | object): void {
   if (command === 'about') emit('open-about')
   else if (command === 'settings') emit('open-settings')
+  else if (command === 'update') emit('open-update')
   else if (command === 'help') emit('open-help')
 }
 
@@ -82,14 +89,20 @@ async function importConfig() {
       </button>
 
       <el-dropdown trigger="click" popper-class="tb-dropdown" @command="onMenu">
-        <button class="mb" title="关于 / 配置 / 使用说明">
+        <button class="mb" :title="hasUpdate ? '有新版本可用' : '关于 / 配置 / 检查更新 / 使用说明'">
           <span>关于</span>
+          <!-- 有新版本时只点一个点，不弹窗打扰 —— 什么时候装是用户说了算 -->
+          <span v-if="hasUpdate" class="mb-dot" />
           <el-icon class="mb-caret"><ArrowDown /></el-icon>
         </button>
         <template #dropdown>
           <el-dropdown-menu>
             <el-dropdown-item command="about">关于 ThShell</el-dropdown-item>
             <el-dropdown-item command="settings">配置</el-dropdown-item>
+            <el-dropdown-item command="update">
+              检查更新
+              <span v-if="hasUpdate" class="dot" />
+            </el-dropdown-item>
             <el-dropdown-item command="help">使用说明</el-dropdown-item>
           </el-dropdown-menu>
         </template>
@@ -201,6 +214,16 @@ async function importConfig() {
 .mb-caret {
   font-size: 10px;
   color: var(--text-3);
+}
+
+/* "有新版本"提示点：6px 的小圆点，不抢眼但能让人想起来点它 */
+.mb-dot {
+  width: 6px;
+  height: 6px;
+  margin-left: -1px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
 /* el-dropdown 默认是 inline-flex，按钮会被它撑出额外的高度 */

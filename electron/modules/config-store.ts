@@ -10,7 +10,9 @@ const DEFAULT_CONFIG: AppConfig = {
     theme: 'dark',
     fontSize: 14,
     metricInterval: 3000,
-    copyOnSelect: true
+    copyOnSelect: true,
+    // 空 = 不检查更新。内网工具不联网也该能正常用
+    updateFeed: ''
   }
 }
 

@@ -12,6 +12,8 @@ import ServerDialog from './components/ServerDialog.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import AboutDialog from './components/AboutDialog.vue'
 import HelpDialog from './components/HelpDialog.vue'
+import UpdateDialog from './components/UpdateDialog.vue'
+import { runCheck } from './utils/update-state'
 
 const store = useAppStore()
 const serverDialogVisible = ref(false)
@@ -19,6 +21,7 @@ const editingServerId = ref<string | null>(null)
 const settingsVisible = ref(false)
 const aboutVisible = ref(false)
 const helpVisible = ref(false)
+const updateVisible = ref(false)
 
 /**
  * 侧边栏收起状态。用 localStorage 记住，而不是塞进 config.settings ——
@@ -70,6 +73,18 @@ onMounted(async () => {
   offProgress = window.api.sftp.onProgress((payload) => store.pushTransfer(payload))
   // 记录由主进程写（路径只有它拿得到原件），写完通知一声，界面重新拉列表
   offTransfer = window.api.transfer.onChanged(() => void store.loadTransferLog())
+
+  // 启动后静默查一次更新：只在配了更新源时查，而且**不弹窗** ——
+  // 有新版就在「关于」按钮上点个圆点，装不装、什么时候装由用户决定。
+  // 延迟 3 秒是为了不跟首屏的连接、配置加载抢带宽。
+  const feed = (store.config.settings.updateFeed || '').trim()
+  if (feed) {
+    setTimeout(() => {
+      void runCheck(feed).then((res) => {
+        if (res?.hasUpdate) console.log('[update] 有新版本', res.latest)
+      })
+    }, 3000)
+  }
 })
 
 onUnmounted(() => {
@@ -90,6 +105,7 @@ onUnmounted(() => {
       @toggle-sidebar="toggleSidebar"
       @open-about="aboutVisible = true"
       @open-help="helpVisible = true"
+      @open-update="updateVisible = true"
     />
 
     <div class="app-body">
@@ -125,6 +141,7 @@ onUnmounted(() => {
     <SettingsDialog v-model="settingsVisible" />
     <AboutDialog v-model="aboutVisible" />
     <HelpDialog v-model="helpVisible" />
+    <UpdateDialog v-model="updateVisible" @open-settings="openSettings" />
   </div>
 </template>
 
