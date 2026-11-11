@@ -48,7 +48,8 @@ function run(cmd, args, opts = {}) {
 // 1. 宿主机构建前端产物（vite build + vue-tsc），容器里只负责"装壳"
 if (!skipBuild) {
   console.log('[dist:linux] 1/2 构建渲染进程与主进程…')
-  run('npm', ['run', 'build'], { shell: process.platform === 'win32' })
+  // 直接跑脚本，不经过 npm —— 否则 npm 会对着 pnpm 导出的 npm_config_* 念 8 行警告
+  run(process.execPath, ['scripts/build.mjs'])
 }
 
 // 2. Linux 本机：直接打，不用 Docker（最快，也是 CI 里 ubuntu-latest 的路径）

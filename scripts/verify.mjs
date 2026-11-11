@@ -56,7 +56,9 @@ const TIMEOUT_MS = 150_000
 
 function runBuild() {
   console.log('▶ build（vue-tsc + vite）…')
-  const r = spawnSync('npm', ['run', 'build'], { cwd: root, stdio: 'inherit', shell: true })
+  // 走 scripts/build.mjs 而不是 `npm run build`：npm 会把 pnpm 导出的
+  // npm_config_* 全部当成"不认识的配置"警告一遍（详见 build.mjs 顶部注释）
+  const r = spawnSync(process.execPath, ['scripts/build.mjs'], { cwd: root, stdio: 'inherit' })
   if (r.status !== 0) {
     console.error('✗ build 失败，先修编译错误')
     process.exit(1)

@@ -57,6 +57,22 @@ pnpm dist         # 构建并用 electron-builder 出安装包（release/）
 
 配置集中在 `electron-builder.yml`（不再塞在 `package.json` 的 `build` 字段里）。
 
+### 打包脚本顺手处理的两件事
+
+`pnpm dist:win` 走的不是裸 `electron-builder`，中间隔了 `scripts/dist.mjs`：
+
+1. **先结束还在跑的 ThShell**。electron-builder 打包前会清空 `release/win-unpacked`，
+   只要里面有文件被打开着（上一次打出来的程序没退干净、杀毒软件正在扫 `app.asar`），
+   就会报 `remove …app.asar: The process cannot access the file because it is being used by another process`
+   然后整次打包中止。脚本先 `taskkill /F /IM ThShell.exe`，再带重试删旧目录。
+2. **还是删不掉就换地方打**。输出目录临时改到 `%TEMP%\thshell-release`，
+   打完把安装包拷回 `release/`，并点名是哪个文件卡着。这样即使有顽固句柄也不会卡住发版 ——
+   想恢复"就地打包"，关掉相关程序重跑或重启一次即可。
+
+顺带解释了那些刷屏的 `npm warn Unknown env config "electron-mirror"`：
+根因是用 pnpm 启动时它会把 `.npmrc` 的每个键导出成 `npm_config_*`，子进程里的 npm 不认识就挨个告警。
+现在链路里不再调 npm（`scripts/build.mjs` 直接调 `node_modules/.bin` 里的 `vue-tsc` / `vite`），警告自然消失。
+
 ### 为什么 macOS 包只能在 Mac 上打
 
 `dmg` 要 `hdiutil`，签名要 `codesign` + 钥匙串，都是 macOS 独有的工具；在 Windows 上跑
