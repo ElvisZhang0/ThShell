@@ -136,25 +136,28 @@ async function save() {
 
     <div class="section">
       <div class="section-title">更新</div>
+      <div class="field row">
+        <div class="label">
+          <span>启动时自动检查</span>
+          <span class="hint">关掉后只有手动点「检查更新」才联网</span>
+        </div>
+        <el-switch v-model="settings.updateAutoCheck" />
+      </div>
       <div class="field">
         <div class="label">
           <span>更新源</span>
-          <span class="hint">latest.json 的完整地址；清空 = 不检查更新</span>
+          <span class="hint">留空就用官方 GitHub Releases</span>
         </div>
         <el-input
           v-model="settings.updateFeed"
           size="small"
           clearable
-          placeholder="https://github.com/…/releases/latest/download/latest.json"
+          :placeholder="DEFAULT_UPDATE_FEED"
         />
         <div class="hint" style="margin-top: 6px">
-          默认走 GitHub Releases，发版时把 <code class="mono">latest.json</code> 和安装包传到 Release 即可。
-          内网机器可以换成自己的静态目录或共享盘（支持 http/https 与 file://）。
-        </div>
-        <div v-if="settings.updateFeed !== DEFAULT_UPDATE_FEED" class="hint" style="margin-top: 6px">
-          <el-button link type="primary" size="small" @click="settings.updateFeed = DEFAULT_UPDATE_FEED">
-            恢复官方 GitHub 源
-          </el-button>
+          默认走 GitHub Releases（<code class="mono">releases/latest/download/latest.json</code>），
+          发版时把清单和安装包传到 Release 即可，什么都不用配。
+          内网机器可以在这里填自己的静态目录或共享盘（支持 http/https 与 file://）。
         </div>
       </div>
     </div>

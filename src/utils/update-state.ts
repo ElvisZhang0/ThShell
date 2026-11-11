@@ -1,5 +1,17 @@
 import { reactive } from 'vue'
+import { DEFAULT_UPDATE_FEED } from '../../electron/types'
 import type { UpdateCheckResult, UpdateProgress } from '../../electron/types'
+
+/**
+ * 把配置里的更新源解析成真正要请求的地址。
+ *
+ * 空 = 用内置的 GitHub Releases（装完就能用，不需要用户配任何东西）。
+ * 这个函数单独抽出来是为了能在冒烟里离线断言 —— 否则只能真发一次请求才知道解析对不对。
+ */
+export function resolveFeed(feed: string | undefined | null): string {
+  const custom = (feed || '').trim()
+  return custom || DEFAULT_UPDATE_FEED
+}
 
 /**
  * 检查更新的界面状态。
@@ -30,11 +42,7 @@ export function resetDownload(): void {
 /** 检查一次。返回结果方便调用方决定要不要弹窗（启动时的静默检查只看 available） */
 export async function runCheck(feed: string): Promise<UpdateCheckResult | null> {
   if (updateState.checking) return updateState.result
-  const target = (feed || '').trim()
-  if (!target) {
-    updateState.result = { current: '', hasUpdate: false, error: '还没有配置更新源' }
-    return updateState.result
-  }
+  const target = resolveFeed(feed)
   updateState.checking = true
   updateState.error = ''
   updateState.message = ''

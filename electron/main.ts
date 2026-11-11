@@ -3325,8 +3325,9 @@ function createWindow(): void {
         push('JSON 坏掉时给出可读的错误', !!broken.error, broken.error ?? '无')
         const missing = await checkForUpdates(`${base}/nope.json`)
         push('404 时把状态码带出来', (missing.error ?? '').includes('404'), missing.error ?? '无')
-        const empty = await checkForUpdates('')
-        push('没配更新源时提示去配置', (empty.error ?? '').includes('没有配置'), empty.error ?? '无')
+        // 空源不再报"没配" —— 它会落到内置的 GitHub 源（types.ts 的 DEFAULT_UPDATE_FEED）。
+        // 那条路要真联网，冒烟里只验常量本身，别在这儿等超时。
+        push('空更新源不再报"没配"', DEFAULT_UPDATE_FEED.includes('/releases/latest/download/'), DEFAULT_UPDATE_FEED)
 
         // 5. 下载 + 校验和
         let lastPercent = 0
@@ -3438,7 +3439,13 @@ function createWindow(): void {
           return d ? (d.textContent || '').trim() : ''
         })()`)) as string
         push('弹窗打开了', dlgText.length > 0, dlgText.slice(0, 40))
-        push('没配更新源时给出引导而不是空白', dlgText.includes('更新源'), dlgText.slice(0, 60))
+        // 更新源为空时现在会自动去查 GitHub —— 这条只断言"有反馈、不是空白"，
+        // 不断言具体文案（联网结果取决于网络，不该让冒烟跟着飘）
+        push(
+          '查更新的瞬间就有反馈，不是空白',
+          dlgText.includes('检查') || dlgText.includes('版本') || dlgText.includes('更新源'),
+          dlgText.slice(0, 60)
+        )
         await shot('thshell-update.png')
         await js(`[...document.querySelectorAll('.el-dialog')]
           .filter((el) => el.getBoundingClientRect().width > 0)

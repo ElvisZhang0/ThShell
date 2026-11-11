@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { DEFAULT_UPDATE_FEED } from '../types'
 import type { UpdateAsset, UpdateCheckResult, UpdateManifest, UpdateProgress } from '../types'
 
 /**
@@ -115,8 +116,9 @@ async function readText(url: string, signal: AbortSignal): Promise<string> {
  */
 export async function checkForUpdates(feed: string): Promise<UpdateCheckResult> {
   const current = app.getVersion()
-  const url = (feed || '').trim()
-  if (!url) return { current, hasUpdate: false, error: '没有配置更新源（留空即关闭检查更新）' }
+  // 空就落到内置的 GitHub 源 —— 界面那边也会解析一次，这里兜底是为了
+  // "配置是空但提示没配源"这种自相矛盾的情况永远不会出现
+  const url = (feed || '').trim() || DEFAULT_UPDATE_FEED
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 15_000)

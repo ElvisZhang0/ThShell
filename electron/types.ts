@@ -44,11 +44,15 @@ export interface AppSettings {
   /**
    * 更新源：指向一个 latest.json 的完整 URL（支持 http/https 与 file://）。
    *
-   * 默认值就是内置的 {{DEFAULT_UPDATE_FEED}}（GitHub Releases），装完即用。
-   * **留空 = 关掉检查更新** —— 内网机器完全不联网也能用，不该因为查不到更新就报错。
-   * 想彻底断网就把这一格清空，别只关弹窗。
+   * **留空 = 用内置的 {{DEFAULT_UPDATE_FEED}}（GitHub Releases）** —— 装完就能查更新，
+   * 不需要用户配任何东西。填了就用填的（内网静态目录、共享盘都行）。
    */
   updateFeed: string
+  /**
+   * 启动时静默检查更新。默认开。
+   * 纯内网机器关掉它，就只有在「关于 → 检查更新」里手动点才会联网。
+   */
+  updateAutoCheck: boolean
 }
 
 /**

@@ -1,5 +1,4 @@
 import { defineStore } from 'pinia'
-import { DEFAULT_UPDATE_FEED } from '../../electron/types'
 import type {
   AppConfig,
   MetricSnapshot,
@@ -54,7 +53,9 @@ const EMPTY_CONFIG: AppConfig = {
     fontSize: 14,
     metricInterval: 3000,
     copyOnSelect: true,
-    updateFeed: DEFAULT_UPDATE_FEED
+    // 空 = 用内置 GitHub 源（见 update-state.ts 的 resolveFeed）
+    updateFeed: '',
+    updateAutoCheck: true
   }
 }
 
@@ -128,9 +129,9 @@ export const useAppStore = defineStore('app', {
             fontSize: s.fontSize ?? 14,
             metricInterval: s.metricInterval ?? 3000,
             copyOnSelect: s.copyOnSelect ?? true,
-            // 老配置里没这个字段 → 补默认的 GitHub 源；
-            // 显式存着空串的，是用户自己关掉的，不动它
-            updateFeed: s.updateFeed ?? DEFAULT_UPDATE_FEED
+            // 空 = 走内置的 GitHub 源；老配置没有这两个字段时补默认值
+            updateFeed: s.updateFeed ?? '',
+            updateAutoCheck: s.updateAutoCheck ?? true
           }
         }
       } catch (err) {

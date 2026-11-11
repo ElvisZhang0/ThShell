@@ -1,7 +1,7 @@
 import { app, safeStorage } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DEFAULT_UPDATE_FEED, type AppConfig, type ServerConfig } from '../types'
+import type { AppConfig, ServerConfig } from '../types'
 
 const DEFAULT_CONFIG: AppConfig = {
   groups: [{ id: 'default', name: '默认分组' }],
@@ -11,8 +11,9 @@ const DEFAULT_CONFIG: AppConfig = {
     fontSize: 14,
     metricInterval: 3000,
     copyOnSelect: true,
-    // 默认就走 GitHub Releases，装完即用；清空这一格才算关掉检查更新
-    updateFeed: DEFAULT_UPDATE_FEED
+    // 更新源留空 = 用内置的 GitHub Releases；填了就用填的
+    updateFeed: '',
+    updateAutoCheck: true
   }
 }
 

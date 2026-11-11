@@ -4,6 +4,7 @@ import { useAppStore } from '../stores/app'
 import { formatSize, formatSpeed } from '../utils/transfer-format'
 import {
   cancelDownload,
+  resolveFeed,
   runCheck,
   runDownload,
   runInstall,
@@ -23,7 +24,11 @@ const visible = computed({
   set: (v: boolean) => emit('update:modelValue', v)
 })
 
-const feed = computed(() => (store.config.settings.updateFeed || '').trim())
+/**
+ * 空 = 用内置 GitHub 源（resolveFeed 里兜底），所以这里只是"当前生效的地址"，
+ * 界面不再有"没配更新源"这种状态 —— 装完就能查。
+ */
+const feed = computed(() => resolveFeed(store.config.settings.updateFeed))
 const r = computed(() => updateState.result)
 const pct = computed(() => updateState.progress.percent)
 
@@ -71,15 +76,14 @@ function goSettings(): void {
         正在检查更新…
       </div>
 
-      <!-- 出错：更新源没配 / 连不上 / JSON 不对 -->
+      <!-- 出错：连不上 / JSON 不对 / 版本号非法 -->
       <template v-else-if="r?.error">
         <div class="row warn">{{ r.error }}</div>
         <div class="row muted">
           当前版本 <span class="mono">{{ r.current || '—' }}</span>
         </div>
-        <div v-if="!feed" class="row muted">
-          这一格现在是空的（= 关掉了检查更新）。在「配置 → 更新源」里点「恢复官方 GitHub 源」就能用；
-          内网机器也可以填自己的静态目录。
+        <div class="row muted">
+          更新源：<span class="mono elide">{{ feed }}</span>
         </div>
       </template>
 
@@ -128,7 +132,8 @@ function goSettings(): void {
 
     <template #footer>
       <div class="foot">
-        <el-button v-if="!feed" size="small" @click="goSettings">去配置更新源</el-button>
+        <!-- 出错时给个改源的入口：默认走 GitHub，连不上就换自建目录 -->
+        <el-button v-if="r?.error" size="small" @click="goSettings">换个更新源</el-button>
         <el-button size="small" :disabled="updateState.checking || updateState.downloading" @click="retry">
           重新检查
         </el-button>
@@ -177,6 +182,14 @@ function goSettings(): void {
 
 .muted {
   color: var(--text-3);
+}
+
+/* 更新源地址可能很长（GitHub 那串），一行放不下就截断，别把弹窗撑宽 */
+.elide {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
 }
 
 .warn {

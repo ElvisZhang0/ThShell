@@ -74,13 +74,13 @@ onMounted(async () => {
   // 记录由主进程写（路径只有它拿得到原件），写完通知一声，界面重新拉列表
   offTransfer = window.api.transfer.onChanged(() => void store.loadTransferLog())
 
-  // 启动后静默查一次更新：只在配了更新源时查，而且**不弹窗** ——
-  // 有新版就在「关于」按钮上点个圆点，装不装、什么时候装由用户决定。
+  // 启动后静默查一次更新：默认就走内置的 GitHub 源，不需要用户配任何东西。
+  // **不弹窗** —— 有新版只在「关于」按钮上点个圆点，装不装、什么时候装由用户决定。
   // 延迟 3 秒是为了不跟首屏的连接、配置加载抢带宽。
-  const feed = (store.config.settings.updateFeed || '').trim()
-  if (feed) {
+  // 纯内网机器可以在「配置 → 更新」里关掉自动检查，那样只有手动点才会联网。
+  if (store.config.settings.updateAutoCheck !== false) {
     setTimeout(() => {
-      void runCheck(feed).then((res) => {
+      void runCheck(store.config.settings.updateFeed || '').then((res) => {
         if (res?.hasUpdate) console.log('[update] 有新版本', res.latest)
       })
     }, 3000)
