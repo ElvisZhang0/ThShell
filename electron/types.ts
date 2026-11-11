@@ -300,6 +300,10 @@ export interface TransferProgress {
   fileCount?: number
   /** 目录传输时已完成的文件数 */
   fileDone?: number
+  /** 用户点了暂停（流没断，只是不再流动；继续之后从原处接着走） */
+  paused?: boolean
+  /** 用户点了取消。和"失败"分开：一个是用户的选择，一个是出了错 */
+  canceled?: boolean
   done: boolean
   error?: string
 }
@@ -328,6 +332,8 @@ export interface TransferRecord {
   ms: number
   /** 失败原因，成功为空 */
   error?: string
+  /** 用户中途取消（不是出错）。界面上灰着显示「已取消」，别跟失败混一块 */
+  canceled?: boolean
 }
 
 /** 传输记录最多留多少条。200 条 ≈ 一年日常量，JSON 也就几十 KB */
@@ -347,6 +353,11 @@ export interface DirDownloadResult {
   failed: { path: string; message: string }[]
   skipped: number
   bytes: number
+  /**
+   * 用户中途点了取消。
+   * 调用方必须看这个字段：剪切模式下"传完就删源"，取消了却还删源等于直接毁数据。
+   */
+  canceled?: boolean
 }
 
 /** 二进制文件内容（base64），办公文档预览用 */
@@ -433,6 +444,8 @@ export interface DirUploadResult {
   failed: { path: string; message: string }[]
   skipped: number
   bytes: number
+  /** 用户中途取消。剪切模式下调用方不能因为"部分成功"就去删源 */
+  canceled?: boolean
 }
 
 /** 粘贴模式：复制会保留源，剪切成功后删掉源 */
@@ -648,6 +661,13 @@ export interface ThShellApi {
     clear: () => Promise<TransferRecord[]>
     /** 主进程写入一条新记录时回调，界面据此刷新列表 */
     onChanged: (cb: () => void) => () => void
+    /**
+     * 暂停 / 继续 / 取消。参数是 `transferId`（进度事件里带的那个）。
+     * 返回 false 表示这条已经在收尾了（找不到控制对象），不是错误，按钮照常失效即可。
+     */
+    pause: (transferId: string) => Promise<boolean>
+    resume: (transferId: string) => Promise<boolean>
+    cancel: (transferId: string) => Promise<boolean>
   }
   local: {
     home: () => Promise<string>

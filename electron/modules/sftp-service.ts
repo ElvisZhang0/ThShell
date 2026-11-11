@@ -12,6 +12,14 @@ import type {
 import { EDIT_MAX_BYTES } from '../types'
 import { decodeText, encodeText, sniffEncoding, type DecodedText, type TextEncoding } from './text-guard'
 import { clampLines, collectTail, emptyTail } from './log-tail'
+import {
+  dropPart,
+  pipeFile,
+  registerTask,
+  TransferCanceled,
+  TransferControl,
+  unregisterTask
+} from './transfer-task'
 
 /** SFTP 路径永远用 /，不要用 node:path（Windows 上会给你拼出反斜杠） */
 export function joinRemote(dir: string, name: string): string {
@@ -308,6 +316,8 @@ interface ReporterInit {
 }
 
 interface Reporter {
+  /** 传输 id：界面的暂停/继续/取消都拿它当句柄，必须和任务注册表里的一致 */
+  readonly id: string
   setTotal(total: number): void
   /** 设置绝对已传字节（单文件 step 回调给的就是累计值） */
   progress(transferred: number, total?: number): void
@@ -315,7 +325,9 @@ interface Reporter {
   add(bytes: number): void
   /** 完成一个文件（目录传输用） */
   countFile(): void
-  finish(error?: string): void
+  /** 暂停/继续时立刻推一帧，不用等下一次节流窗口 */
+  setPaused(paused: boolean): void
+  finish(error?: string, canceled?: boolean): void
 }
 
 /**
@@ -344,13 +356,15 @@ function createReporter(
   let sampleBytes = 0
   let lastEmitAt = 0
   let closed = false
+  let paused = false
 
-  function emit(done: boolean, error?: string, force = false): void {
+  function emit(done: boolean, error?: string, force = false, canceled?: boolean): void {
     if (closed) return
     const now = Date.now()
     if (!done && !force && now - lastEmitAt < PROGRESS_INTERVAL) return
     lastEmitAt = now
 
+    // 暂停期间速度归零：留着上一次的读数会让人以为还在跑
     const dt = now - sampleAt
     if (dt > 0) {
       const instant = ((transferred - sampleBytes) / dt) * 1000
@@ -370,10 +384,12 @@ function createReporter(
       dir: init.dir,
       transferred,
       total,
-      speed: Math.max(0, Math.round(speed)),
+      speed: paused ? 0 : Math.max(0, Math.round(speed)),
       elapsed: now - startedAt,
       fileCount: init.fileCount,
       fileDone: init.fileCount ? fileDone : undefined,
+      paused,
+      canceled,
       done,
       error
     })
@@ -381,6 +397,7 @@ function createReporter(
   }
 
   return {
+    id: transferId,
     setTotal(next: number) {
       if (next > 0) total = next
     },
@@ -396,11 +413,17 @@ function createReporter(
     countFile() {
       fileDone++
     },
-    finish(error?: string) {
-      // 成功时对齐到 total，进度条才会走满；失败保留实际值，别把进度清零
-      if (!error && total > 0) transferred = total
-      speed = error ? 0 : speed
-      emit(true, error, true)
+    setPaused(next: boolean) {
+      paused = next
+      // 强制推一帧：点下去按钮文字要立刻变，不能等 100ms 节流
+      emit(false, undefined, true)
+    },
+    finish(error?: string, canceled?: boolean) {
+      // 成功时对齐到 total，进度条才会走满；失败/取消保留实际值，别把进度清零
+      if (!error && !canceled && total > 0) transferred = total
+      if (error || canceled) speed = 0
+      paused = false
+      emit(true, error, true, canceled)
     }
   }
 }
@@ -409,6 +432,42 @@ function statRemote(sftp: SFTPWrapper, remotePath: string): Promise<{ size: numb
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (err, stats) => (err ? reject(err) : resolve(stats)))
   })
+}
+
+/**
+ * 一次传输的公共外壳：建上报器 → 建控制器 → 登记进注册表 → 收口。
+ *
+ * 收口这块最容易写漏：取消要落成"已取消"而不是"失败"，而且得先把半成品删掉，
+ * 否则下次会以为能接着传、其实数据是断的。集中在这里写一次，四个入口都不用再操心。
+ *
+ * work 可以返回一句"部分失败"的提示（目录传输里个别文件没权限就走这条路），
+ * 返回值会作为告警写进记录。
+ */
+async function runTask(
+  init: ReporterInit,
+  onProgress: (p: TransferProgress) => void,
+  work: (ctx: { ctl: TransferControl; reporter: Reporter }) => Promise<string | void>,
+  /** 出错时拿哪个远端路径去翻译（下载是源，上传是目标） */
+  remoteForError: string
+): Promise<void> {
+  const reporter = createReporter(init, onProgress)
+  // onChange 里引用 ctl：暂停/继续要立刻推一帧，等 100ms 节流的话按钮会有明显延迟
+  const ctl = new TransferControl(reporter.id, () => reporter.setPaused(ctl.paused))
+  registerTask(ctl)
+  try {
+    const warning = await work({ ctl, reporter })
+    reporter.finish(warning || undefined)
+  } catch (err) {
+    if (err instanceof TransferCanceled) {
+      reporter.finish(undefined, true)
+      throw err
+    }
+    const message = translateSftpError(err as Error, remoteForError)
+    reporter.finish(message)
+    throw new Error(message)
+  } finally {
+    unregisterTask(reporter.id)
+  }
 }
 
 export async function downloadRemote(
@@ -421,46 +480,46 @@ export async function downloadRemote(
   fs.mkdirSync(path.dirname(localPath), { recursive: true })
   const filename = path.basename(remotePath)
 
-  // 先 stat 一次：进度条第一帧就能显示总大小，而不是等第一个 chunk 到达
+  // 先 stat 一次：进度条第一帧就能显示总大小，而不是等第一个 chunk 到达。
+  // 顺带也是续传的前提 —— 没有总大小就没法判断 .part 是不是已经传完了。
   let size = 0
   try {
     size = (await statRemote(sftp, remotePath)).size
   } catch {
-    /* 拿不到就算了，step 回调里还有 total */
+    /* 拿不到就当未知：此时不做续传，老老实实从头传 */
   }
 
-  const reporter = createReporter(
-    {
-      sessionId,
-      direction: 'download',
-      filename,
-      from: remotePath,
-      to: localPath,
-      total: size
-    },
-    onProgress
-  )
-  reporter.progress(0, size)
-
-  await new Promise<void>((resolve, reject) => {
-    sftp.fastGet(
-      remotePath,
-      localPath,
-      {
-        step: (transferred, _chunk, total) => reporter.progress(transferred, total)
-      },
-      (err) => {
-        if (err) {
-          const message = translateSftpError(err, remotePath)
-          reporter.finish(message)
-          reject(new Error(message))
-          return
-        }
-        reporter.finish()
-        resolve()
+  await runTask(
+    { sessionId, direction: 'download', filename, from: remotePath, to: localPath, total: size },
+    onProgress,
+    async ({ ctl, reporter }) => {
+      let sent = 0
+      try {
+        await pipeFile({
+          sftp,
+          direction: 'download',
+          from: remotePath,
+          to: localPath,
+          total: size,
+          ctl,
+          // 从 .part 的末尾接着传时，先把进度条摆到断点位置
+          onResume: (start) => {
+            sent = start
+            reporter.progress(sent, size)
+          },
+          onBytes: (n) => {
+            sent += n
+            reporter.progress(sent, size)
+          }
+        })
+      } catch (err) {
+        // 取消 = 放弃：半成品留着只会让人误以为"下次还能续"
+        if (err instanceof TransferCanceled) await dropPart('download', sftp, localPath)
+        throw err
       }
-    )
-  })
+    },
+    remotePath
+  )
   return localPath
 }
 
@@ -477,41 +536,38 @@ export async function uploadLocal(
   try {
     size = fs.statSync(localPath).size
   } catch {
-    /* 文件在选完之后被删掉了，交给 fastPut 报错 */
+    /* 文件在选完之后被删掉了，交给流去报错 */
   }
 
-  const reporter = createReporter(
-    {
-      sessionId,
-      direction: 'upload',
-      filename,
-      from: localPath,
-      to: remotePath,
-      total: size
-    },
-    onProgress
-  )
-  reporter.progress(0, size)
-
-  await new Promise<void>((resolve, reject) => {
-    sftp.fastPut(
-      localPath,
-      remotePath,
-      {
-        step: (transferred, _chunk, total) => reporter.progress(transferred, total)
-      },
-      (err) => {
-        if (err) {
-          const message = translateSftpError(err, remotePath)
-          reporter.finish(message)
-          reject(new Error(message))
-          return
-        }
-        reporter.finish()
-        resolve()
+  await runTask(
+    { sessionId, direction: 'upload', filename, from: localPath, to: remotePath, total: size },
+    onProgress,
+    async ({ ctl, reporter }) => {
+      let sent = 0
+      try {
+        await pipeFile({
+          sftp,
+          direction: 'upload',
+          from: localPath,
+          to: remotePath,
+          total: size,
+          ctl,
+          onResume: (start) => {
+            sent = start
+            reporter.progress(sent, size)
+          },
+          onBytes: (n) => {
+            sent += n
+            reporter.progress(sent, size)
+          }
+        })
+      } catch (err) {
+        if (err instanceof TransferCanceled) await dropPart('upload', sftp, remotePath)
+        throw err
       }
-    )
-  })
+    },
+    remotePath
+  )
   return remotePath
 }
 
@@ -600,43 +656,86 @@ export async function downloadDirectory(
   const acc: ScanAcc = { files: [], totalBytes: 0, skipped: 0 }
   await scanRemoteDir(sftp, remotePath, '', acc)
 
-  const reporter = createReporter(
-    {
-      sessionId,
-      direction: 'download',
-      filename: `${folderName}（${acc.files.length} 个文件）`,
-      from: remotePath,
-      to: localPath,
-      dir: true,
-      total: Math.max(acc.totalBytes, 1),
-      fileCount: acc.files.length
-    },
-    onProgress
-  )
-  reporter.progress(0)
-
   fs.mkdirSync(localPath, { recursive: true })
 
   const failed: { path: string; message: string }[] = []
   let downloaded = 0
 
-  for (const file of acc.files) {
-    const target = toLocalPath(localPath, file.rel)
-    try {
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      await new Promise<void>((resolve, reject) => {
-        sftp.fastGet(file.remote, target, (err) => (err ? reject(err) : resolve()))
-      })
-      downloaded++
-    } catch (err) {
-      failed.push({ path: file.remote, message: translateSftpError(err as Error, file.remote) })
+  try {
+    await runTask(
+      {
+        sessionId,
+        direction: 'download',
+        filename: `${folderName}（${acc.files.length} 个文件）`,
+        from: remotePath,
+        to: localPath,
+        dir: true,
+        total: Math.max(acc.totalBytes, 1),
+        fileCount: acc.files.length
+      },
+      onProgress,
+      async ({ ctl, reporter }) => {
+        // batch = 前面那些文件已经计入的字节；当前文件的进度叠在它上面，
+        // 这样一次目录传输在界面上是一条连续的进度条，而不是每个文件归零重来
+        let batch = 0
+        for (const file of acc.files) {
+          // 暂停挡在"下一个文件"之前，取消直接抛出去
+          await ctl.gate()
+          const target = toLocalPath(localPath, file.rel)
+          let cur = 0
+          try {
+            fs.mkdirSync(path.dirname(target), { recursive: true })
+            await pipeFile({
+              sftp,
+              direction: 'download',
+              from: file.remote,
+              to: target,
+              total: file.size,
+              ctl,
+              onResume: (start) => {
+                cur = start
+                reporter.progress(batch + cur)
+              },
+              onBytes: (n) => {
+                cur += n
+                reporter.progress(batch + cur)
+              }
+            })
+            downloaded++
+          } catch (err) {
+            if (err instanceof TransferCanceled) {
+              await dropPart('download', sftp, target)
+              throw err
+            }
+            // 单个文件失败不中断整体 —— 大目录传到第 300 个因为一个没权限的文件
+            // 整体作废，体验太差
+            failed.push({ path: file.remote, message: translateSftpError(err as Error, file.remote) })
+            // 失败的文件按整块推进，否则进度条会卡在半路再也不动
+            cur = file.size
+          }
+          batch += cur
+          reporter.progress(batch)
+          reporter.countFile()
+        }
+        return failed.length ? `${failed.length} 个文件下载失败` : undefined
+      },
+      remotePath
+    )
+  } catch (err) {
+    // 取消：已经传完的照实返回，不要当成失败往上抛 ——
+    // 界面刚收到"已取消"，再弹一个红框说"下载失败"只会让人困惑
+    if (err instanceof TransferCanceled) {
+      return {
+        total: acc.files.length,
+        downloaded,
+        failed,
+        skipped: acc.skipped,
+        bytes: acc.totalBytes,
+        canceled: true
+      }
     }
-    // 失败的文件也要推进，否则进度条会卡住
-    reporter.countFile()
-    reporter.add(file.size)
+    throw err
   }
-
-  reporter.finish(failed.length ? `${failed.length} 个文件下载失败` : undefined)
 
   return {
     total: acc.files.length,
@@ -741,27 +840,12 @@ export async function uploadDirectory(
   const acc: LocalScanAcc = { files: [], dirs: [], totalBytes: 0, skipped: 0 }
   scanLocalDir(localDir, '', acc)
 
-  const reporter = createReporter(
-    {
-      sessionId,
-      direction: 'upload',
-      filename: `${folderName}（${acc.files.length} 个文件）`,
-      from: localDir,
-      to: remotePath,
-      dir: true,
-      total: Math.max(acc.totalBytes, 1),
-      fileCount: acc.files.length
-    },
-    onProgress
-  )
-  reporter.progress(0)
-
   const created = new Set<string>()
   const failed: { path: string; message: string }[] = []
   let uploaded = 0
 
   // 先把目标目录本身和所有子目录建出来：
-  // 只靠 fastPut 前逐级 ensure 的话，空目录会被整个丢掉（本地有、远端没有），
+  // 只靠上传前逐级 ensure 的话，空目录会被整个丢掉（本地有、远端没有），
   // 而且整个目录一个文件都没有时远端连根目录都不会建。
   try {
     await ensureRemoteDir(sftp, remotePath, created)
@@ -772,23 +856,73 @@ export async function uploadDirectory(
     failed.push({ path: remotePath, message: translateSftpError(err as Error, remotePath) })
   }
 
-  for (const file of acc.files) {
-    const remoteFile = joinRemote(remotePath, file.rel)
-    try {
-      await ensureRemoteDir(sftp, path.posix.dirname(remoteFile), created)
-      await new Promise<void>((resolve, reject) => {
-        sftp.fastPut(file.src, remoteFile, (err) => (err ? reject(err) : resolve()))
-      })
-      uploaded++
-    } catch (err) {
-      failed.push({ path: file.src, message: translateSftpError(err as Error, remoteFile) })
+  try {
+    await runTask(
+      {
+        sessionId,
+        direction: 'upload',
+        filename: `${folderName}（${acc.files.length} 个文件）`,
+        from: localDir,
+        to: remotePath,
+        dir: true,
+        total: Math.max(acc.totalBytes, 1),
+        fileCount: acc.files.length
+      },
+      onProgress,
+      async ({ ctl, reporter }) => {
+        let batch = 0
+        for (const file of acc.files) {
+          await ctl.gate()
+          const remoteFile = joinRemote(remotePath, file.rel)
+          let cur = 0
+          try {
+            await ensureRemoteDir(sftp, path.posix.dirname(remoteFile), created)
+            await pipeFile({
+              sftp,
+              direction: 'upload',
+              from: file.src,
+              to: remoteFile,
+              total: file.size,
+              ctl,
+              onResume: (start) => {
+                cur = start
+                reporter.progress(batch + cur)
+              },
+              onBytes: (n) => {
+                cur += n
+                reporter.progress(batch + cur)
+              }
+            })
+            uploaded++
+          } catch (err) {
+            if (err instanceof TransferCanceled) {
+              await dropPart('upload', sftp, remoteFile)
+              throw err
+            }
+            failed.push({ path: file.src, message: translateSftpError(err as Error, remoteFile) })
+            cur = file.size
+          }
+          batch += cur
+          reporter.progress(batch)
+          reporter.countFile()
+        }
+        return failed.length ? `${failed.length} 个文件上传失败` : undefined
+      },
+      remotePath
+    )
+  } catch (err) {
+    if (err instanceof TransferCanceled) {
+      return {
+        total: acc.files.length,
+        uploaded,
+        failed,
+        skipped: acc.skipped,
+        bytes: acc.totalBytes,
+        canceled: true
+      }
     }
-    // 失败的文件也推进，否则进度条会卡住
-    reporter.countFile()
-    reporter.add(file.size)
+    throw err
   }
-
-  reporter.finish(failed.length ? `${failed.length} 个文件上传失败` : undefined)
 
   return {
     total: acc.files.length,

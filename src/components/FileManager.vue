@@ -489,9 +489,15 @@ async function uploadOne(filePath: string) {
   const name = filePath.split(/[\\/]/).pop() ?? 'upload.bin'
   busy.value = true
   try {
-    await window.api.sftp.upload(props.tab.sessionId, filePath, joinRemote(remotePath.value, name))
+    // 取消时返回空串：不算失败，也不该报"已上传"
+    const ok = await window.api.sftp.upload(
+      props.tab.sessionId,
+      filePath,
+      joinRemote(remotePath.value, name)
+    )
     await loadRemote()
-    ElMessage.success(`已上传 ${name}`)
+    if (ok) ElMessage.success(`已上传 ${name}`)
+    else ElMessage.info('已取消上传')
   } catch (err) {
     ElMessage.error('上传失败：' + cleanError(err))
   } finally {
@@ -620,12 +626,20 @@ async function doPaste(side: 'local' | 'remote') {
               entry.path,
               joinRemote(destDir, entry.name)
             )
+            // 用户点了取消：整批停下。**不能**往下走到"剪切删源"那一步
+            if (res.canceled) break
             if (res.failed.length) {
               failed.push(...res.failed)
               continue
             }
           } else {
-            await window.api.sftp.upload(sessionId, entry.path, joinRemote(destDir, entry.name))
+            // 取消时主进程返回空串而不是抛错（取消不是失败），这里同样要停下
+            const done1 = await window.api.sftp.upload(
+              sessionId,
+              entry.path,
+              joinRemote(destDir, entry.name)
+            )
+            if (!done1) break
           }
           done++
           // 剪切：传完再删本地源，走回收站，误操作还能捞回来
@@ -640,12 +654,14 @@ async function doPaste(side: 'local' | 'remote') {
           const target = joinLocal(destDir, entry.isDir ? safeLocalName(entry.name) : entry.name)
           if (entry.isDir) {
             const res = await window.api.sftp.downloadDir(sessionId, entry.path, target)
+            if (res.canceled) break
             if (res.failed.length) {
               failed.push(...res.failed)
               continue
             }
           } else {
-            await window.api.sftp.download(sessionId, entry.path, target)
+            const got = await window.api.sftp.download(sessionId, entry.path, target)
+            if (!got) break
           }
           done++
           if (clip.mode === 'cut') {
@@ -1276,16 +1292,21 @@ async function upload() {
     const files = await window.api.dialog.pickFiles()
     if (!files.length) return
     busy.value = true
+    let sent = 0
     for (const file of files) {
       const name = file.split(/[\\/]/).pop() ?? 'upload.bin'
-      await window.api.sftp.upload(
+      const ok = await window.api.sftp.upload(
         props.tab.sessionId,
         file,
         joinRemote(remotePath.value, name)
       )
+      // 取消了一个就整批停下：用户要停，不该继续往下一个文件扑
+      if (!ok) break
+      sent++
     }
     await loadRemote()
-    ElMessage.success(`已上传 ${files.length} 个文件`)
+    if (sent) ElMessage.success(`已上传 ${sent} 个文件`)
+    if (sent < files.length) ElMessage.info(`已取消，还有 ${files.length - sent} 个没传`)
   } catch (err) {
     ElMessage.error('上传失败：' + cleanError(err))
   } finally {
@@ -1333,7 +1354,10 @@ async function uploadFolderTo(localDir: string, remoteDir: string) {
       joinRemote(remoteDir, name)
     )
     await loadRemote()
-    if (result.failed.length) {
+    // 取消不是失败，也不是完成：说清楚"停在哪了"，别报个"已上传"骗人
+    if (result.canceled) {
+      ElMessage.info(`已取消，上传了 ${result.uploaded}/${result.total} 个文件`)
+    } else if (result.failed.length) {
       ElMessage.warning(
         `已上传 ${result.uploaded}/${result.total} 个文件，${result.failed.length} 个失败：${result.failed[0].message}`
       )
@@ -1373,7 +1397,9 @@ async function download() {
         dest
       )
       await loadLocal()
-      if (result.failed.length) {
+      if (result.canceled) {
+        ElMessage.info(`已取消，下载了 ${result.downloaded}/${result.total} 个文件`)
+      } else if (result.failed.length) {
         ElMessage.warning(
           `已下载 ${result.downloaded}/${result.total} 个文件，${result.failed.length} 个失败（可能是权限或文件名非法）`
         )
@@ -1381,13 +1407,15 @@ async function download() {
         ElMessage.success(`已下载 ${result.total} 个文件到 ${dest}`)
       }
     } else {
-      await window.api.sftp.download(
+      // 取消时主进程返回空串（不是抛错），别报"下载完成"
+      const got = await window.api.sftp.download(
         props.tab.sessionId,
         target.path,
         joinLocal(localPath.value, target.name)
       )
       await loadLocal()
-      ElMessage.success('下载完成')
+      if (got) ElMessage.success('下载完成')
+      else ElMessage.info('已取消下载')
     }
   } catch (err) {
     ElMessage.error('下载失败：' + cleanError(err))

@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "icons": "node scripts/make-icons.mjs",
     "verify": "node scripts/verify.mjs",
+    "test:transfer": "node scripts/transfer-e2e.mjs",
     "dist": "node scripts/dist.mjs",
     "dist:win": "node scripts/dist.mjs win",
     "dist:linux": "node scripts/build-linux.mjs",

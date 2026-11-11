@@ -13,7 +13,7 @@
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useAppStore } from '../stores/app'
-import { ArrowDown, Download, Sort, Upload } from '@element-plus/icons-vue'
+import { ArrowDown, Close, Download, Sort, Upload, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import {
   formatDuration,
   formatEta,
@@ -46,8 +46,10 @@ const failCount = computed(() => store.transferLog.filter((r) => r.error).length
 const summary = computed(() => {
   const top = active.value[0]
   if (top) {
+    const dir = top.direction === 'upload' ? '上传' : '下载'
+    if (top.paused) return `${dir} ${top.filename} 已暂停 · ${percentOf(top)}%`
     const speed = top.done ? '' : ` · ${formatSpeed(top.speed)}`
-    return `${top.direction === 'upload' ? '上传' : '下载'} ${top.filename} ${percentOf(top)}%${speed}`
+    return `${dir} ${top.filename} ${percentOf(top)}%${speed}`
   }
   const last = store.transferLog[0]
   if (!last) return '还没有上传 / 下载记录'
@@ -144,6 +146,28 @@ onMounted(() => {
             <span class="name truncate">{{ item.filename }}</span>
             <span class="m speed mono">{{ item.done ? '' : formatSpeed(item.speed) }}</span>
             <span class="m pct mono">{{ percentOf(item) }}%</span>
+
+            <!--
+              暂停 / 继续 / 取消只在"还没结束"时给。
+              done 那一帧（成功后界面还会挂 1.2 秒）再给按钮，点了也不会有反应，纯属误导。
+            -->
+            <span v-if="!item.done" class="ctl">
+              <button
+                class="c-btn"
+                :title="item.paused ? '继续传输' : '暂停传输'"
+                @click.stop="
+                  item.paused ? store.resumeTransfer(item.transferId) : store.pauseTransfer(item.transferId)
+                "
+              >
+                <el-icon>
+                  <VideoPlay v-if="item.paused" />
+                  <VideoPause v-else />
+                </el-icon>
+              </button>
+              <button class="c-btn danger" title="取消传输" @click.stop="store.cancelTransfer(item.transferId)">
+                <el-icon><Close /></el-icon>
+              </button>
+            </span>
           </div>
           <div class="l1">
             <el-progress
@@ -461,6 +485,49 @@ onMounted(() => {
 .bar {
   flex: 1;
   min-width: 0;
+}
+
+/*
+ * 行内的暂停 / 取消按钮。
+ * 常驻显示而不是 hover 才出现：传输区本来就只有几行，"要传完了才发现能暂停"
+ * 比"稍微占点地方"更糟。做成无边框图标，视觉上不会盖过进度条。
+ */
+.ctl {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  /*
+   * 高度必须压在 16px：面板的高度是按"四行刚好装得下"标定的（冒烟里有断言），
+   * 按钮做成 20px 就会把每行顶高 5px，四行累计 20px，直接多出一条滚动条。
+   */
+  height: 16px;
+}
+
+.c-btn {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.c-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-1);
+}
+
+.c-btn.danger:hover {
+  background: var(--danger-soft, rgba(248, 113, 113, 0.14));
+  color: var(--danger);
 }
 
 /* EP 默认进度槽是浅灰，深色主题下会亮得刺眼；太淡又看不见 4px 的槽 */

@@ -327,6 +327,38 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    /**
+     * 暂停 / 继续 / 取消传输。
+     *
+     * 这里只发指令、不本地改状态：真正"停/走"的是主进程里那条数据流，
+     * 本地先改会让界面显示"已暂停"但其实还在传。主进程会把新状态顺着进度事件推回来
+     * （暂停/取消时会立刻强推一帧，不用等 100ms 节流）。
+     * 返回 false 说明这条已经在收尾了，属于正常情况，不当错误处理。
+     */
+    async pauseTransfer(transferId: string) {
+      try {
+        await window.api.transfer.pause(transferId)
+      } catch {
+        /* 已经传完了，忽略 */
+      }
+    },
+
+    async resumeTransfer(transferId: string) {
+      try {
+        await window.api.transfer.resume(transferId)
+      } catch {
+        /* 同上 */
+      }
+    },
+
+    async cancelTransfer(transferId: string) {
+      try {
+        await window.api.transfer.cancel(transferId)
+      } catch {
+        /* 同上 */
+      }
+    },
+
     async loadTransferLog() {
       try {
         this.transferLog = await window.api.transfer.list()

@@ -83,7 +83,13 @@ const api: ThShellApi = {
       const handler = () => cb()
       ipcRenderer.on('transfer:changed', handler)
       return () => ipcRenderer.removeListener('transfer:changed', handler)
-    }
+    },
+    pause: (transferId: string): Promise<boolean> =>
+      ipcRenderer.invoke('transfer:pause', transferId),
+    resume: (transferId: string): Promise<boolean> =>
+      ipcRenderer.invoke('transfer:resume', transferId),
+    cancel: (transferId: string): Promise<boolean> =>
+      ipcRenderer.invoke('transfer:cancel', transferId)
   },
   local: {
     home: () => ipcRenderer.invoke('local:home'),

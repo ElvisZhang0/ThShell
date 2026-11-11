@@ -38,6 +38,7 @@ import {
   uploadLocal,
   writeRemoteFile
 } from './modules/sftp-service'
+import { cancelTask, pauseTask, resumeTask, TransferCanceled } from './modules/transfer-task'
 import { copyLocal, moveLocal, pasteRemote } from './modules/file-ops'
 import {
   cancelDownload,
@@ -3864,6 +3865,43 @@ function createWindow(): void {
           expanded.text.find((t) => t.includes('D:\\backup'))?.slice(0, 80) || '没找到'
         )
 
+        // 暂停 / 取消按钮：进行中的行必须各有两个，且提示文案对得上
+        const btns = (await js(`(() => {
+          const rows = [...document.querySelectorAll('.dock .row.live')]
+          return {
+            rows: rows.length,
+            counts: rows.map((r) => r.querySelectorAll('.ctl .c-btn').length),
+            titles: rows.flatMap((r) =>
+              [...r.querySelectorAll('.ctl .c-btn')].map((b) => b.getAttribute('title') || '')
+            )
+          }
+        })()`)) as { rows: number; counts: number[]; titles: string[] }
+        push(
+          '进行中的任务有暂停 + 取消两个按钮',
+          btns.rows >= 2 && btns.counts.every((n) => n === 2),
+          `${btns.rows} 行 / 按钮数 ${btns.counts.join('、')}`
+        )
+        push(
+          '按钮提示文案正确',
+          btns.titles.includes('暂停传输') && btns.titles.includes('取消传输'),
+          btns.titles.join(' ')
+        )
+
+        // 暂停态：状态列和按钮都要跟着翻。主进程暂停时会强推一帧，这里直接模拟那一帧
+        mainWindow!.webContents.send('sftp:progress', { ...base, ...rows[0], paused: true, speed: 0 })
+        await wait(400)
+        const pausedRow = (await js(`(() => {
+          // 按文件名找那一行：列表按"最新的在最上面"排，位置不固定
+          const row = [...document.querySelectorAll('.dock .row.live')]
+            .find((r) => r.textContent.includes('database-2026-11-09.tar.gz'))
+          return {
+            text: (row?.textContent || '').replace(/\\s+/g, ' ').trim(),
+            title: row?.querySelector('.ctl .c-btn')?.getAttribute('title') || ''
+          }
+        })()`)) as { text: string; title: string }
+        push('暂停后状态显示「已暂停」', pausedRow.text.includes('已暂停'), pausedRow.text.slice(0, 60))
+        push('暂停后按钮变成「继续传输」', pausedRow.title === '继续传输', pausedRow.title)
+
         // 记录是主进程写的：塞两条假的，等它推 transfer:changed 让界面重拉
         const now = Date.now()
         const fake = [
@@ -4200,7 +4238,8 @@ function registerIpc(): void {
         size: p.total,
         at: Date.now(),
         ms: p.elapsed,
-        error: p.error
+        error: p.error,
+        canceled: p.canceled
       })
       // 让界面重新拉一次列表：记录是主进程写的，渲染层只能被动知道
       safeSend('transfer:changed')
@@ -4210,6 +4249,16 @@ function registerIpc(): void {
 
   register('transfer:list', () => loadTransferLog())
   register('transfer:clear', () => clearTransferLog())
+
+  /**
+   * 传输的三个控制动作。
+   *
+   * 界面只知道 transferId（从进度事件里拿的），所以这里必须靠 id 去注册表里找回控制对象 ——
+   * 找不到说明这一条刚结束，返回 false 让按钮自然失效，不要报错。
+   */
+  register('transfer:pause', (id: string) => pauseTask(id))
+  register('transfer:resume', (id: string) => resumeTask(id))
+  register('transfer:cancel', (id: string) => cancelTask(id))
 
   register('sftp:list', async (sessionId: string, remotePath: string) => {
     // 冒烟模式要知道当前标签页的真实 sessionId 才能灌假进度，顺手记一下
@@ -4221,7 +4270,13 @@ function registerIpc(): void {
   })
   register('sftp:download', async (sessionId: string, remotePath: string, localPath: string) => {
     const sftp = await ssh.getSftp(sessionId)
-    return downloadRemote(sftp, remotePath, localPath, emitProgress, sessionId)
+    try {
+      return await downloadRemote(sftp, remotePath, localPath, emitProgress, sessionId)
+    } catch (err) {
+      // 用户主动取消不算错误：界面已经收到"已取消"，这里再往上抛只会多弹一个红框
+      if (err instanceof TransferCanceled) return ''
+      throw err
+    }
   })
   register('sftp:downloadDir', async (sessionId: string, remotePath: string, localPath: string) => {
     const sftp = await ssh.getSftp(sessionId)
@@ -4229,7 +4284,12 @@ function registerIpc(): void {
   })
   register('sftp:upload', async (sessionId: string, localPath: string, remotePath: string) => {
     const sftp = await ssh.getSftp(sessionId)
-    return uploadLocal(sftp, localPath, remotePath, emitProgress, sessionId)
+    try {
+      return await uploadLocal(sftp, localPath, remotePath, emitProgress, sessionId)
+    } catch (err) {
+      if (err instanceof TransferCanceled) return ''
+      throw err
+    }
   })
   register('sftp:uploadDir', async (sessionId: string, localDir: string, remotePath: string) => {
     const sftp = await ssh.getSftp(sessionId)

@@ -60,6 +60,12 @@ const SHORTCUTS: Array<[string, string]> = [
           上传下载的进度和<strong>历史记录</strong>在底部面板，记录里写了「从哪个目录到哪个目录」，
           默认收起，收起时也能看到当前进度。状态栏显示当前会话的 CPU / 内存 / 网速，点开还有系统信息和 Docker 面板。
         </p>
+        <p>
+          进行中的任务每行右侧有<strong>暂停 / 继续</strong>和<strong>取消</strong>两个按钮：暂停只是让数据停下，
+          连接和句柄都还在，点继续从原处接着走；取消才算放弃。
+          大文件支持<strong>断点续传</strong> —— 传输中的半成品叫 <code>xxx.part</code>，
+          中断之后再来一次会自动从它的末尾接着传，不用重头开始。
+        </p>
       </section>
 
       <section>

@@ -45,7 +45,9 @@ export function percentOf(item: TransferProgress): number {
 
 export function transferState(item: TransferProgress): string {
   if (item.error) return '失败'
-  if (item.done) return '完成'
+  if (item.done) return item.canceled ? '已取消' : '完成'
+  // 暂停优先于文件计数：暂停时最该让人看到的是"停着呢"，不是"3/120"
+  if (item.paused) return '已暂停'
   if (item.fileCount) return `${item.fileDone ?? 0}/${item.fileCount}`
   return '传输中'
 }
