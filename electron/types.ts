@@ -42,10 +42,11 @@ export interface AppSettings {
   /** 复制即选中 */
   copyOnSelect: boolean
   /**
-   * 更新源：指向一个 latest.json 的完整 URL（支持 http/https 与 file://）。
+   * 自定义更新源：指向一个 latest.json 的完整 URL（http/https/file://）。
    *
-   * **留空 = 用内置的 GitHub Releases 通道（含国内加速镜像，自动选可用的）** ——
-   * 装完就能查更新，不需要用户配任何东西。填了就用填的（内网静态目录、共享盘都行）。
+   * **一般不用动**，界面上也没有这一项 —— 留空就用内置的三条通道（见 DEFAULT_UPDATE_FEEDS）。
+   * 只有内网部署、必须走自己的静态目录/共享盘时才手改配置文件：填了就只走它，
+   * 不会再并发去连 GitHub（内网机器不该因为"兜底"而漏流量出去）。
    */
   updateFeed: string
   /**

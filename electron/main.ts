@@ -3581,6 +3581,17 @@ function createWindow(): void {
         await clickMenu('配置')
         await wait(700)
         push('「配置」打开设置弹窗', await dialogOpen('设置'))
+        // 更新源已经内置，设置里不该再冒出那个输入框 —— 加回来就等于又把选择推给用户
+        const feedInput = (await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')]
+            .filter((el) => el.getBoundingClientRect().width > 0).pop()
+          if (!d) return -1
+          return [...d.querySelectorAll('input')].filter(
+            (i) => /latest\\.json|releases\\/latest/.test(i.placeholder || '') ||
+                   /^https:\\/\\/github/.test(i.value || '')
+          ).length
+        })()`)) as number
+        push('设置里没有「更新源」输入框', feedInput === 0, feedInput < 0 ? '弹窗没找到' : `相关输入框 ${feedInput} 个`)
         await closeDialog()
         await wait(500)
 

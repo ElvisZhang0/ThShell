@@ -14,7 +14,6 @@ import {
 const props = defineProps<{ modelValue: boolean }>()
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
-  (e: 'open-settings'): void
 }>()
 
 const store = useAppStore()
@@ -60,11 +59,6 @@ async function download(): Promise<void> {
 
 async function install(): Promise<void> {
   await runInstall()
-}
-
-function goSettings(): void {
-  visible.value = false
-  emit('open-settings')
 }
 </script>
 
@@ -133,8 +127,6 @@ function goSettings(): void {
 
     <template #footer>
       <div class="foot">
-        <!-- 出错时给个改源的入口：默认走 GitHub，连不上就换自建目录 -->
-        <el-button v-if="r?.error" size="small" @click="goSettings">换个更新源</el-button>
         <el-button size="small" :disabled="updateState.checking || updateState.downloading" @click="retry">
           重新检查
         </el-button>

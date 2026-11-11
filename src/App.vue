@@ -141,7 +141,7 @@ onUnmounted(() => {
     <SettingsDialog v-model="settingsVisible" />
     <AboutDialog v-model="aboutVisible" />
     <HelpDialog v-model="helpVisible" />
-    <UpdateDialog v-model="updateVisible" @open-settings="openSettings" />
+    <UpdateDialog v-model="updateVisible" />
   </div>
 </template>
 

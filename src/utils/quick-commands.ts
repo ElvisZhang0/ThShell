@@ -205,6 +205,65 @@ export const QUICK_GROUPS: QuickGroup[] = [
     ]
   },
   {
+    label: 'Docker',
+    commands: [
+      {
+        cmd: 'docker ps -a',
+        desc: '所有容器（含已退出的）',
+        note: '不加 -a 只列运行中的 —— 排查"容器怎么没了"十有八九是退出后被藏起来了。STATUS 一列里 "Exited (137)" 是 128+9，被 SIGKILL 杀的',
+        hot: true
+      },
+      {
+        cmd: 'docker ps -a --format "{{.Names}}\t{{.Status}}"',
+        desc: '容器名 + 状态，一行一个',
+        note: '默认表格列太多，窄终端会折行看不清。--format 里的 \\t 是 docker 自己解析的转义，不用写成真 tab'
+      },
+      {
+        cmd: 'docker stats --no-stream',
+        desc: '各容器 CPU / 内存占用快照',
+        note: '必须带 --no-stream，否则会持续刷新把终端占住；NAME 列对应 docker ps 的 NAMES。MEM LIMIT 显示的是限制值，不是机器总内存'
+      },
+      {
+        cmd: 'docker logs --tail 100 -f ',
+        desc: '实时跟随容器日志（末尾 100 行）',
+        note: '在末尾补容器名。--tail 一定要给，否则几万行历史日志一口气灌进来；Ctrl+C 只退出跟随，不影响容器',
+        mode: 'fill'
+      },
+      {
+        cmd: 'docker exec -it ',
+        desc: '进容器里执行命令',
+        note: '补「容器名 sh」或「容器名 bash」。alpine / distroless 这类镜像没有 bash，只能用 sh；少了 -it 就只是把命令发过去，没有交互',
+        mode: 'fill'
+      },
+      {
+        cmd: 'docker inspect -f "{{.State.Status}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}" ',
+        desc: '容器的真实状态、是否被 OOM 杀、重启次数',
+        note: '在末尾补容器名。OOMKilled 为 true 说明是被内存上限杀的，不是自己崩的；RestartCount 涨得快说明在反复重启',
+        mode: 'fill'
+      },
+      {
+        cmd: 'docker system df',
+        desc: '镜像 / 容器 / 卷 / 构建缓存各占多少',
+        note: '磁盘满时的第一条命令。多半是构建缓存和悬空镜像吃掉的；加 -v 能看到每个镜像、每个卷各占多少'
+      },
+      {
+        cmd: 'docker image prune -f',
+        desc: '清理悬空镜像（<none> 那些）',
+        note: '只删没被任何容器引用的中间层，相对安全。要连没在用的正常镜像一起删，用 docker image prune -a —— 那个会把你手动 build 的镜像也带走'
+      },
+      {
+        cmd: 'docker compose ps',
+        desc: 'compose 项目里的容器与端口',
+        note: 'v2 插件写法。CentOS 7 那批机器装的还是 v1，命令是 docker-compose ps（带连字符），报 "is not a docker command" 就是版本问题'
+      },
+      {
+        cmd: 'docker volume ls',
+        desc: '所有数据卷',
+        note: '容器删了卷还在，久了会悄悄把磁盘占满。确认没用的用 docker volume rm 删；正在被容器引用的删不掉，这是保护'
+      }
+    ]
+  },
+  {
     label: '日志与排查',
     commands: [
       {

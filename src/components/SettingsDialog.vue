@@ -3,7 +3,6 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Download, InfoFilled } from '@element-plus/icons-vue'
 import { useAppStore, cleanError } from '../stores/app'
-import { DEFAULT_UPDATE_FEED } from '../../electron/types'
 import type { AppSettings } from '../../electron/types'
 
 const props = defineProps<{ modelValue: boolean }>()
@@ -144,19 +143,9 @@ async function save() {
         <el-switch v-model="settings.updateAutoCheck" />
       </div>
       <div class="field">
-        <div class="label">
-          <span>更新源</span>
-          <span class="hint">留空就用官方 GitHub Releases</span>
-        </div>
-        <el-input
-          v-model="settings.updateFeed"
-          size="small"
-          clearable
-          :placeholder="DEFAULT_UPDATE_FEED"
-        />
-        <div class="hint" style="margin-top: 6px">
-          留空就用内置通道：GitHub 直连 + 国内加速镜像并发探路，谁通走谁，不用配。
-          要换成自己的静态目录或共享盘（支持 http/https 与 file://）就填在这里，填了就只走它。
+        <div class="hint">
+          更新源已内置（GitHub Releases + 国内加速通道并发探路，谁通走谁），不需要配置。
+          内网部署要换成自己的静态目录时，改配置文件里的 <code class="mono">updateFeed</code>。
         </div>
       </div>
     </div>
