@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    ThShell 应用图标
+    主体是终端提示符 ">_" —— 而不是字母缩写。
+    理由：16×16 的任务栏尺寸下两个字母会糊成一团，提示符的折角加光标块
+    依然清晰；同时 ">_" 是跨语言、跨平台的终端通用符号，不需要读文字就懂。
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#212c3c" />
+      <stop offset="52%" stop-color="#151c27" />
+      <stop offset="100%" stop-color="#0a0e14" />
+    </linearGradient>
+
+    <linearGradient id="mark" x1="0.05" y1="0" x2="0.95" y2="1">
+      <stop offset="0%" stop-color="#7cf0dd" />
+      <stop offset="42%" stop-color="#2dd4bf" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.26" />
+      <stop offset="60%" stop-color="#2dd4bf" stop-opacity="0.06" />
+      <stop offset="100%" stop-color="#2dd4bf" stop-opacity="0" />
+    </radialGradient>
+
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.09" />
+      <stop offset="38%" stop-color="#ffffff" stop-opacity="0" />
+    </linearGradient>
+
+    <clipPath id="shape">
+      <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232" />
+    </clipPath>
+  </defs>
+
+  <!-- 底板 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232" fill="url(#bg)" />
+
+  <g clip-path="url(#shape)">
+    <!-- 顶部屏幕反光，让深色底板在深色任务栏里也有体积感 -->
+    <rect x="0" y="0" width="1024" height="560" fill="url(#sheen)" />
+    <!-- 提示符背后的柔光 -->
+    <ellipse cx="512" cy="524" rx="330" ry="290" fill="url(#glow)" />
+  </g>
+
+  <!-- 一圈极淡的内描边，勾出边缘 -->
+  <rect
+    x="1.5"
+    y="1.5"
+    width="1021"
+    height="1021"
+    rx="230.5"
+    ry="230.5"
+    fill="none"
+    stroke="#ffffff"
+    stroke-opacity="0.09"
+    stroke-width="3"
+  />
+
+  <!-- 提示符主体：小尺寸导出时由 make-icons.mjs 放大这里，底板保持不变 -->
+  <g id="mark-group" transform="translate(512 512) scale(1) translate(-512 -512)">
+    <!-- 折角箭头 > -->
+    <path
+      d="M316 340 L496 512 L316 684"
+      fill="none"
+      stroke="url(#mark)"
+      stroke-width="88"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+
+    <!-- 光标块：底部与箭头视觉底边齐平，像终端里的光标贴着基线 -->
+    <rect x="572" y="640" width="180" height="88" rx="44" ry="44" fill="url(#mark)" />
+  </g>
+</svg>

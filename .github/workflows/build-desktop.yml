@@ -1,0 +1,87 @@
+name: build-desktop
+
+# 什么时候跑：
+#   1. 手动点（Actions → build-desktop → Run workflow）—— 平时发版用这个
+#   2. 打 tag（v0.1.0）—— 顺手把产物挂到 Release 上
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false        # 一个平台挂了别把其它平台的结果也丢掉
+      matrix:
+        include:
+          - name: Windows (x64)
+            os: windows-latest
+            args: --win --x64
+            artifact: ThShell-windows
+          # macos-latest 是 arm64 机器，两个架构都能从它交叉打出来
+          - name: macOS (x64 + arm64)
+            os: macos-latest
+            args: --mac --x64 --arm64
+            artifact: ThShell-macos
+          # 在 Linux 上原生构建，不用 Docker —— 这也是唯一能产出 deb/rpm 的环境
+          - name: Linux (AppImage / deb / rpm / tar.gz)
+            os: ubuntu-latest
+            args: --linux AppImage deb rpm tar.gz
+            artifact: ThShell-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 前端 + 主进程一起构建（vue-tsc 顺带做类型检查，类型错就不出包）
+      - run: pnpm build
+
+      - name: 打包
+        run: npx electron-builder ${{ matrix.args }} --publish never
+        env:
+          # 没有签名证书：显式告诉 electron-builder 别去找钥匙串
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          # 只收成品，别把 unpacked 目录（几百个文件）一起传上去
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      # 打了 tag 才挂 Release，手动跑只出 artifact
+      - name: 上传到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz

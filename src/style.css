@@ -1,0 +1,475 @@
+/* ============================================================
+   ThShell 主题变量
+   深色为默认：远程终端工具长时间盯屏，浅色底在夜里太扎眼。
+   浅色通过 <html data-theme="light"> 整体覆盖，见文件末尾。
+   ============================================================ */
+:root {
+  --bg-base: #0f1218;
+  --bg-panel: #161a23;
+  --bg-panel-2: #1b202b;
+  --bg-elevated: #232936;
+  --bg-hover: #212734;
+  --bg-active: #26303f;
+
+  --border: #252c39;
+  --border-soft: #1e242f;
+
+  --text-1: #dce4ef;
+  --text-2: #93a0b4;
+  --text-3: #5d697c;
+
+  --accent: #2dd4bf;
+  --accent-2: #38bdf8;
+  --accent-soft: rgba(45, 212, 191, 0.13);
+  --accent-line: rgba(45, 212, 191, 0.35);
+
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+
+  /* 图标尺寸阶梯：Element Plus 的图标是 1024 viewBox 的方形 SVG，
+     字形只占 1em 的七成多，所以 font-size 要比"想要的视觉高度"再放一档。
+     正文 11.5px 时，行内图标给 16 才不至于像装饰点。 */
+  --icon-xs: 14px;  /* 折叠箭头、页签关闭、内联小提示 */
+  --icon-sm: 16px;  /* 行内图标：页签、路径栏控件、底栏工具、列表里的文件/文件夹 */
+  --icon-md: 17px;  /* 标题栏 / 侧栏这类"旁边有文字的按钮" */
+  --icon-lg: 19px;  /* 备用档：一组并列的小按钮比行内再重一档时用 */
+  /* 单独摆在空白里的图标（服务器行的「连接」按钮）用这一档：
+     周围没有文字做参照，同字号看起来比行内图标小一圈；
+     而且 Connection / ArrowLeft 这类"扁宽"字形本身就只占 viewBox 的一半高。 */
+  --icon-xl: 21px;
+
+  /* 语义化细节色：抽成变量，浅色主题才能整体替换 */
+  --titlebar-bg: linear-gradient(180deg, #1a1f2a 0%, #141821 100%);
+  --dot-idle: #3d4759;
+  --icon-muted: #7d879a;
+  --scroll-thumb: #2c3444;
+  --scroll-thumb-hover: #3c4759;
+  --grid-line: rgba(255, 255, 255, 0.05);
+  --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.55);
+  /* 提示气泡：比面板再亮一档，且始终与主题反向（深色界面用更深的底、浅色界面用深底白字） */
+  --tooltip-bg: #2b3344;
+  --tooltip-fg: #e8eef7;
+  --tooltip-border: rgba(255, 255, 255, 0.09);
+  --shadow-dialog: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --hover-tint: rgba(255, 255, 255, 0.06);
+  --sheet-bg: #0f1218;
+  --tag-local-fg: #93c5fd;
+  --tag-local-bg: rgba(59, 130, 246, 0.15);
+
+  --radius: 8px;
+  --radius-lg: 12px;
+
+  --font-ui: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', 'Menlo', monospace;
+
+  --sidebar-w: 260px;
+  --tabbar-h: 42px;
+  --statusbar-h: 26px;
+
+  color-scheme: dark;
+
+  /* Element Plus 覆盖 */
+  --el-color-primary: #2dd4bf;
+  --el-color-primary-light-3: #4fe0ce;
+  --el-color-primary-light-5: #7ce8da;
+  --el-color-primary-light-7: #a9f0e6;
+  --el-color-primary-light-8: #c6f5ee;
+  --el-color-primary-light-9: #e3faf7;
+  --el-color-primary-dark-2: #24a99a;
+  --el-bg-color: var(--bg-panel);
+  --el-bg-color-overlay: var(--bg-elevated);
+  --el-fill-color-blank: var(--bg-panel-2);
+  --el-border-color: var(--border);
+  --el-border-color-light: var(--border);
+  --el-border-color-lighter: var(--border-soft);
+  --el-text-color-primary: var(--text-1);
+  --el-text-color-regular: var(--text-2);
+  --el-text-color-secondary: var(--text-3);
+  --el-mask-color: rgba(10, 13, 18, 0.75);
+  /* EP 默认的 fill 是一整套近白色阶（#f5f7fa 之类），不映射的话任何
+     "hover / 选中 / 禁用" 底色都会在深色界面上糊成一块白 —— 这就是
+     text 按钮悬停变白块的根源。按深浅层级对齐到我们自己的灰阶。 */
+  --el-fill-color: var(--bg-active);
+  --el-fill-color-light: var(--bg-hover);
+  --el-fill-color-lighter: var(--bg-panel-2);
+  --el-fill-color-extra-light: var(--bg-panel);
+  --el-fill-color-dark: var(--bg-active);
+  --el-fill-color-darker: var(--bg-active);
+  --el-text-color-disabled: var(--text-3);
+  --el-text-color-placeholder: var(--text-3);
+  --el-disabled-bg-color: var(--bg-panel-2);
+  --el-disabled-border-color: var(--border);
+}
+
+/* ============================================================
+   浅色主题
+   只覆盖变量，不改任何组件样式 —— 组件全部走 var()，
+   所以一处切换就能整体换肤。主色在浅底上要压深，否则青绿发飘。
+   ============================================================ */
+[data-theme='light'] {
+  --bg-base: #ebeff5;
+  --bg-panel: #ffffff;
+  --bg-panel-2: #f4f6fa;
+  --bg-elevated: #ffffff;
+  --bg-hover: #e9edf4;
+  --bg-active: #dde3ec;
+
+  --border: #d5dce6;
+  --border-soft: #e6ebf2;
+
+  --text-1: #1c2635;
+  --text-2: #4a5668;
+  --text-3: #6d798b;
+
+  --accent: #0d9488;
+  --accent-2: #0284c7;
+  --accent-soft: rgba(13, 148, 136, 0.1);
+  --accent-line: rgba(13, 148, 136, 0.35);
+
+  --success: #059669;
+  --warning: #d97706;
+  --danger: #dc2626;
+
+  --titlebar-bg: linear-gradient(180deg, #ffffff 0%, #f1f4f9 100%);
+  --dot-idle: #c3cbd8;
+  --icon-muted: #7b8798;
+  --scroll-thumb: #c6cede;
+  --scroll-thumb-hover: #aab5c8;
+  --grid-line: rgba(24, 39, 60, 0.07);
+  --shadow-pop: 0 12px 30px rgba(24, 39, 60, 0.14);
+  --tooltip-bg: #1f2a3a;
+  --tooltip-fg: #f4f7fb;
+  --tooltip-border: transparent;
+  --shadow-dialog: 0 24px 60px rgba(24, 39, 60, 0.18);
+  --hover-tint: rgba(24, 39, 60, 0.05);
+  --sheet-bg: #ffffff;
+  --tag-local-fg: #2563eb;
+  --tag-local-bg: rgba(37, 99, 235, 0.1);
+
+  color-scheme: light;
+
+  --el-color-primary: #0d9488;
+  --el-color-primary-light-3: #4aada4;
+  --el-color-primary-light-5: #86c9c2;
+  --el-color-primary-light-7: #b7ded9;
+  --el-color-primary-light-8: #d0e9e6;
+  --el-color-primary-light-9: #e6f4f2;
+  --el-color-primary-dark-2: #0a766d;
+  --el-bg-color: var(--bg-panel);
+  --el-bg-color-overlay: var(--bg-elevated);
+  --el-fill-color-blank: #ffffff;
+  --el-border-color: var(--border);
+  --el-border-color-light: var(--border);
+  --el-border-color-lighter: var(--border-soft);
+  --el-text-color-primary: var(--text-1);
+  --el-text-color-regular: var(--text-2);
+  --el-text-color-secondary: var(--text-3);
+  --el-mask-color: rgba(24, 39, 60, 0.45);
+  /* 弹窗遮罩走的是 overlay 变量，不覆盖的话浅底上几乎看不出有遮罩 */
+  --el-overlay-color-lighter: rgba(24, 39, 60, 0.42);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--text-1);
+  background: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+input,
+textarea {
+  user-select: text;
+}
+
+/* ---------- 滚动条 ---------- */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: content-box;
+}
+
+/* ---------- 通用工具类 ---------- */
+.flex {
+  display: flex;
+}
+.flex-col {
+  display: flex;
+  flex-direction: column;
+}
+.items-center {
+  align-items: center;
+}
+.justify-between {
+  justify-content: space-between;
+}
+.gap-4 {
+  gap: 4px;
+}
+.gap-8 {
+  gap: 8px;
+}
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* ---------- Element Plus 细节统一 ---------- */
+.el-button {
+  font-weight: 500;
+}
+
+/* text / link 按钮的悬停底色：EP 走 --el-fill-color-light，上面已映射；
+   这里再兜一道，并统一文字色，避免悬停时字比底色还淡 */
+.el-button.is-text:not(.is-disabled):hover,
+.el-button.is-text:not(.is-disabled):focus-visible {
+  background: var(--bg-hover);
+  color: var(--text-1);
+}
+
+.el-button.is-text.is-disabled {
+  color: var(--text-3);
+  opacity: 0.55;
+}
+
+/* 实心主色按钮的禁用态：EP 拿 --el-color-primary-light-5 当底色，而这个色阶在深色主题里
+   是"更亮的薄荷"，结果禁用态看着比可点态还亮 —— 点下去没反应，比灰掉更让人困惑。
+   这里统一压成"低饱和 accent + 次级文字"，明暗两套主题都自然。 */
+.el-button--primary.is-disabled,
+.el-button--primary.is-disabled:hover,
+.el-button--primary.is-disabled:focus,
+.el-button--primary.is-disabled:active {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-panel-2));
+  border-color: transparent;
+  color: color-mix(in srgb, var(--text-1) 45%, transparent);
+}
+
+/* 弹窗式提示（tooltip）单独给一套反转色：EP 默认拿 --el-text-color-primary 当底色，
+   而我们把那个变量映射成了正文色，深色下会变成"白底黑字"的灯泡，浅色下又白底白字。
+   提示气泡本来就该和当前主题反着来，所以单独给变量，不跟着面板色走。 */
+.el-popper.is-dark {
+  background: var(--tooltip-bg);
+  border: 1px solid var(--tooltip-border);
+  color: var(--tooltip-fg);
+  font-size: 11.5px;
+  box-shadow: var(--shadow-pop);
+}
+
+.el-popper.is-dark .el-popper__arrow::before {
+  background: var(--tooltip-bg);
+  border-color: var(--tooltip-border);
+}
+
+/* 表单里的前缀/后缀/清空图标也跟着走图标阶梯，否则在全小号字体里会显得过细 */
+.el-input__prefix .el-icon,
+.el-input__suffix .el-icon,
+.el-select__caret,
+.el-input__clear {
+  font-size: var(--icon-sm);
+}
+
+.el-dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-dialog);
+}
+
+.el-dialog__header {
+  border-bottom: 1px solid var(--border-soft);
+  padding-bottom: 14px;
+  margin-bottom: 0;
+}
+
+.el-dialog__body {
+  padding: 18px 20px;
+}
+
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  background-color: var(--bg-base) !important;
+  box-shadow: 0 0 0 1px var(--border) inset !important;
+}
+
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused {
+  box-shadow: 0 0 0 1px var(--accent) inset !important;
+}
+
+.el-tabs__item {
+  color: var(--text-3);
+}
+.el-tabs__item.is-active {
+  color: var(--accent);
+}
+
+.el-message-box {
+  border: 1px solid var(--border);
+}
+
+.el-tooltip__trigger:focus-visible {
+  outline: none;
+}
+
+/* 数字输入框的上下按钮默认是浅色块，在深色主题里非常突兀 */
+.el-input-number.is-controls-right .el-input-number__increase,
+.el-input-number.is-controls-right .el-input-number__decrease {
+  background: var(--bg-elevated) !important;
+  border-color: var(--border) !important;
+  color: var(--text-2) !important;
+}
+
+.el-input-number.is-controls-right .el-input-number__increase:hover,
+.el-input-number.is-controls-right .el-input-number__decrease:hover {
+  color: var(--accent) !important;
+}
+
+.el-input-number .el-input__inner {
+  text-align: left;
+}
+
+/* 窗口拖拽区（自绘标题栏时使用） */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* ---------- 右键菜单（终端、文件管理共用） ---------- */
+.ctx-menu {
+  position: fixed;
+  z-index: 4000;
+  min-width: 186px;
+  padding: 5px;
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  font-size: 12.5px;
+  color: var(--text-1);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ctx-item:hover {
+  background: var(--bg-active);
+}
+
+/* 危险操作（删除这类）用红色，避免和普通项混在一起手滑 */
+.ctx-item.danger {
+  color: var(--danger);
+}
+
+.ctx-item.danger:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.ctx-item.disabled {
+  color: var(--text-3);
+  cursor: default;
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+.ctx-icon {
+  font-size: var(--icon-sm);
+  flex: none;
+  color: var(--icon-muted);
+}
+
+.ctx-item:hover .ctx-icon {
+  color: var(--accent);
+}
+
+.ctx-item.danger .ctx-icon {
+  color: var(--danger);
+}
+
+.ctx-kbd {
+  margin-left: auto;
+  padding-left: 18px;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  /* 不能用 --border：深色下它和 --bg-elevated 只差两三阶，分隔线等于看不见。
+     用文字色兑透明，明暗两套主题都能自然显出层次 */
+  background: color-mix(in srgb, var(--text-1) 14%, transparent);
+}
+
+/* ---------- 路径栏「跳转」下拉 ----------
+   下拉内容的 DOM 被 teleport 到 body，scoped 样式够不着，只能写在这里 */
+.pl-dropdown .el-dropdown-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 240px;
+}
+
+.pl-dropdown .pl-label {
+  color: var(--text-1);
+}
+
+.pl-dropdown .pl-path {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-3);
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- 标题栏「关于」下拉 ----------
+   同样 teleport 到 body，样式只能写在这儿 */
+.tb-dropdown .el-dropdown-menu__item {
+  min-width: 132px;
+  font-size: 12.5px;
+}

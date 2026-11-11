@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      script-src 里的 blob: 是 PDF 预览必须的：pdf.js 的 worker 用
+      `new Worker(blobUrl, { type: 'module' })` 启动（见 PdfPreview.vue 里为什么用 Blob），
+      没有它 worker 和它的 fake-worker 后备都会被 CSP 掐掉，报
+      "Setting up fake worker failed: Failed to fetch dynamically imported module: blob:…"。
+      worker-src 单独写一条是为了不受 child-src 回落规则的影响，各版本 Chromium 表现一致。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: http: https: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; worker-src 'self' blob:"
+    />
+    <title>ThShell</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

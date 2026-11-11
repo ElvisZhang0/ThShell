@@ -1,0 +1,56 @@
+# ============================================================
+# ThShell .gitignore
+# 原则：凡是"能由 pnpm build / electron-builder 重新生成"的，都不进仓库。
+# 仓库里只留源码、配置、图标源文件和文档。
+# ============================================================
+
+# ---------- 依赖 ----------
+node_modules/
+.pnpm-store/
+
+# ---------- 构建产物 ----------
+# vite 输出（渲染层 + 主进程），pnpm build 一条命令就能重建
+dist/
+dist-electron/
+*.tsbuildinfo
+
+# electron-builder 的输出：安装包、win-unpacked、blockmap 全在这儿，
+# 一次打包就 900MB+，绝不能进仓库
+release/
+release-win/
+*.blockmap
+builder-debug.yml
+
+# ---------- 本地工具 / 编辑器 ----------
+# AI 助手的会话记忆、截图、缓存，属于本机状态，不共享
+.workbuddy/
+# WorkBuddy 的应用卡片文件，每次发布都会重新生成
+*.genie
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.vs/
+*.suo
+.history/
+
+# ---------- 日志与临时文件 ----------
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+*.tmp
+.tmp/
+
+# ---------- 环境变量 ----------
+# 这台机器/这台机器上的密钥不该进仓库；需要模板就放 .env.example
+.env
+.env.*
+!.env.example
+
+# ---------- 系统文件 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 杂项 ----------
+coverage/

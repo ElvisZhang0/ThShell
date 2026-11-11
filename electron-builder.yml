@@ -1,0 +1,144 @@
+# electron-builder 打包配置
+#
+# 为什么从 package.json 搬到这里：多平台目标加起来三十多行，塞进 package.json
+# 会把依赖表冲没了；而且 yml 能写注释 —— 下面几条注释都是踩过的坑，不能丢。
+#
+# 各平台**能在哪儿构建**（这是硬限制，不是配置问题）：
+#   Windows  → Windows 本机；Linux 走 Docker；macOS 不可能
+#   macOS    → 三平台都能（但签名/公证必须在 macOS）
+#   Linux    → Linux 本机；Windows 走 Docker；macOS 不行
+# 详见 README「打包发布」。
+
+appId: com.meng.thshell
+productName: ThShell
+copyright: Copyright © 2026 张萌
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - resources/**/*
+  # cpu-features 是可选的加密加速绑定，没编译出来 ssh2 会回退纯 JS，不必塞进包
+  - '!**/node_modules/cpu-features/**'
+
+# ssh2 的原生 .node 必须留在 asar 外面，asar 里的动态库 dlopen 不了
+asarUnpack:
+  - '**/node_modules/ssh2/**'
+  - '**/node_modules/cpu-features/**'
+
+# 不在打包时重编原生模块：仓库里没有 vs 工具链，重编必失败
+npmRebuild: false
+compression: normal
+
+# ---------------------------------------------------------------- Windows
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    # 免安装单文件：给"拷到别人机器上跑一下"的场合，双击即用、不写注册表
+    - target: portable
+      arch: [x64]
+  artifactName: ThShell-${version}-win-${arch}.${ext}
+  # 没买代码签名证书：双击安装包会弹 SmartScreen「Windows 已保护你的电脑」，
+  # 点「更多信息 → 仍要运行」。不是病毒，就是没签名。见 README。
+
+nsis:
+  oneClick: false                          # 给用户选安装位置的机会
+  perMachine: false                        # 默认装到当前用户，不需要管理员
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: ThShell
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  artifactName: ThShell-${version}-win-setup.${ext}
+
+portable:
+  artifactName: ThShell-${version}-win-portable.${ext}
+
+# ------------------------------------------------------------------ macOS
+mac:
+  icon: build/icon.png
+  category: public.app-category.utilities
+  # Apple Silicon 和 Intel 各出一份；不做 universal 单包（体积翻倍，收益不大）
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+  artifactName: ThShell-${version}-mac-${arch}.${ext}
+  # 没有 Apple 开发者证书（$99/年）：不签名、不公证。
+  # 后果：首次打开被 Gatekeeper 拦，要「右键 → 打开」或执行
+  #   xattr -dr com.apple.quarantine /Applications/ThShell.app
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  extendInfo:
+    # Electron 33 的下限；写死是为了告诉用户"这包不支持 10.13"
+    LSMinimumSystemVersion: '10.15'
+
+dmg:
+  title: ThShell ${version}
+  artifactName: ThShell-${version}-mac-${arch}.${ext}
+
+# ------------------------------------------------------------------ Linux
+linux:
+  icon: build/icons
+  category: Utility
+  # 可执行文件名跟 productName 分开写：desktop 文件里 Name 是 ThShell，
+  # 但命令行敲的应该是小写的 thshell
+  executableName: thshell
+  synopsis: 远程终端与文件管理工具
+  description: >
+    ThShell 是一个 SSH/SFTP 客户端：多标签终端、本地与远程双栏文件管理、
+    在线编辑与预览、系统信息采集、传输记录。
+  # 四种格式覆盖不同发行版，见 README 的对照表
+  target:
+    - AppImage
+    - deb
+    - rpm
+    - tar.gz
+  artifactName: ThShell-${version}-linux-${arch}.${ext}
+  desktop:
+    Name: ThShell
+    Comment: SSH/SFTP 终端与文件管理
+    Keywords: ssh;sftp;terminal;file;scp;
+    # 不写这个，任务栏会把窗口当成"另一个程序"，图标对不上
+    StartupWMClass: ThShell
+    # 让文件管理器里能"用 ThShell 打开"…… 目前没有命令行参数支持，先不加 MimeType
+
+deb:
+  # deb 的 control 文件必须有 Maintainer，没有 email 会直接构建失败。
+  # 这一行是占位，改成真实邮箱再发版。
+  maintainer: 张萌 <zhangmeng@example.com>
+  priority: optional
+  # 这些是 Chromium 在裸 Ubuntu 容器里跑起来的底线依赖，写进 Depends
+  # 用户 apt install 时自动装，省得报 "error while loading shared libraries: libnss3.so"
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libsecret-1-0
+    - libgbm1
+    - libasound2
+
+rpm:
+  maintainer: 张萌 <zhangmeng@example.com>
+  # CentOS/RHEL/Rocky/Alma/openSUSE/麒麟/统信 走这一份。
+  # 注意 glibc 门槛见 README —— CentOS 7 装上也起不来。
+  depends:
+    - libnotify
+    - libXScrnSaver
+    - libXtst
+    - at-spi2-core
+    - libsecret
+    - mesa-libgbm
+    - alsa-lib
