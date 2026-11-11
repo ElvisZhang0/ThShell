@@ -130,6 +130,26 @@ pnpm manifest:gh --notes "1. 新增检查更新
 gh release create v0.2.0 latest.json release/ThShell-* --notes "0.2.0"
 ```
 
+发完做一次自检 —— 它会像客户端一样，把三条通道各走一遍：
+
+```bash
+pnpm check:release --expect 0.2.0
+```
+
+输出长这样（有一项 FAIL 就退出码 1，可以直接挂在发版脚本后面）：
+
+```
+  PASS 通道可用：ghfast.top  812ms
+  PASS 通道可用：gh-proxy.com  1033ms
+  FAIL 通道可用：直连 github.com  fetch failed
+  PASS 取到 latest.json  走的是 ghfast.top
+  PASS 清单版本与预期一致  0.2.0
+  PASS Windows 有可自动更新的包  exe/portable
+  PASS 安装包地址可下载  HTTP 200 421ms
+```
+
+直连那条 FAIL 是正常的（国内），只要有一条通，客户端就能查到更新。
+
 两个前提，缺了客户端就查不到：
 
 - **仓库必须是 public**。private 仓库的 Release 附件匿名下载一律 404，客户端没有你的凭据。
