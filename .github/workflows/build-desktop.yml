@@ -82,6 +82,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # 不传 body 也不开 generate_release_notes，Release 页就是空白一片，
+          # 用户点进去只看到十个附件，看不出这版改了什么。
+          # 交给 GitHub 按 tag 之间的提交自动汇总，省得每次手写。
+          generate_release_notes: true
           files: |
             release/*.exe
             release/*.dmg
