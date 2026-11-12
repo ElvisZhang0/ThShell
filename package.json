@@ -1,6 +1,6 @@
 {
   "name": "thshell",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "ThShell - Electron 远程终端与文件管理工具",
   "author": "张萌",
