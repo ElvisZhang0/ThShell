@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { plain } from '../utils/plain'
 import type {
   AppConfig,
   MetricSnapshot,
@@ -69,18 +70,9 @@ export function cleanError(err: unknown): string {
 }
 
 /**
- * 跨进程传对象前必须解包。
- *
- * Pinia 的 state 是响应式 Proxy，contextBridge 在把参数送过边界时走结构化克隆，
- * 而 Proxy 不可克隆 —— 抛出来的是 "An object could not be cloned"，
- * 在界面上长得像「连接失败」，排查时极容易怀疑到网络或认证头上。
- *
- * 这里用 JSON 深拷贝而不是 structuredClone：后者对 Proxy 同样会抛 DataCloneError。
- * 连接配置本身就是纯 JSON 结构，不涉及 Date / Map，深拷贝不会丢信息。
+ * 跨进程传对象前必须解包（实现见 utils/plain.ts）。
+ * 这里原本是本文件内的私有函数，更新弹窗踩了同一个坑之后提到公共位置了。
  */
-function plain<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T
-}
 
 export const useAppStore = defineStore('app', {
   state: () => ({

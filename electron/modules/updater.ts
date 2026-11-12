@@ -389,8 +389,10 @@ export async function installUpdate(filePath: string): Promise<string> {
     // detached + unref：安装程序要活过本进程退出。
     // 不传 /S —— 静默安装遇上 UAC 会卡住且没有任何界面，用户只会觉得"点了没反应"
     spawn(filePath, [], { detached: true, stdio: 'ignore' }).unref()
-    setTimeout(() => app.quit(), 400)
-    return '安装程序已启动，按提示完成后重新打开 ThShell'
+    // 留 1.2 秒再退：自动升级是一步到底的，界面刚显示"正在启动安装程序"就黑掉，
+    // 用户会怀疑是不是崩了。这段时间足够他看清那句话。
+    setTimeout(() => app.quit(), 1200)
+    return '安装程序已启动，本窗口即将关闭，装完会自动重新打开'
   }
 
   if (process.platform === 'darwin') {

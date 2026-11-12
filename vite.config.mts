@@ -36,7 +36,15 @@ export default defineConfig({
             console.log('\n[electron] 已清除继承来的 ELECTRON_RUN_AS_NODE（否则窗口不会出现）')
           }
           console.log('[electron] 启动主进程…')
-          args.startup()
+          // 需要抓界面截图 / 看控制台时才开调试端口（默认不开，正常开发不受影响）。
+          // 端口挑 9223 而不是通用的 9222：同一台机器上可能同时开着别的 Electron 项目，
+          // 抢端口会让后启动的那个静默失去调试能力。
+          const argv = ['.', '--no-sandbox']
+          if (process.env.THSHELL_CDP) {
+            argv.push('--remote-debugging-port=9223')
+            console.log('[electron] 调试端口 9223 已开启（THSHELL_CDP）')
+          }
+          args.startup(argv)
         },
         vite: {
           build: {

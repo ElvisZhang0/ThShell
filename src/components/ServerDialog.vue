@@ -3,6 +3,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { FolderOpened, Key, Lock, Plus, Promotion } from '@element-plus/icons-vue'
 import { useAppStore, cleanError } from '../stores/app'
+import { plain } from '../utils/plain'
 import type { AuthType, ServerConfig } from '../../electron/types'
 
 const props = defineProps<{
@@ -59,11 +60,34 @@ const rules: FormRules = {
   ]
 }
 
+/**
+ * 编辑时磁盘上已经存着的密码 / 私钥口令。
+ *
+ * 表单里这两个框**不回填**：屏幕上摆一串明文没必要，而且"留空 = 不修改"
+ * 这层语义比"看到是什么"更有用。它们在这里只负责一件事 ——
+ * 用户没动密码框时，保存/测试要把原值带上，不能拿空串把它顶掉。
+ */
+const keptPassword = ref('')
+const keptPassphrase = ref('')
+
 function resetForm() {
   const source = props.serverId ? store.serverById(props.serverId) : undefined
   if (source) {
-    Object.assign(form, structuredClone(source))
+    /*
+     * ⚠️ 这里绝对不能写 structuredClone(source)。
+     *
+     * source 是 Pinia state 里的对象，也就是响应式 **Proxy**，结构化克隆遇到
+     * Proxy 直接抛 DataCloneError，resetForm 当场中断 —— 表单一个字段都填不上，
+     * 表现就是「编辑连接没有回显」，而且不报错弹窗、只在控制台留一行。
+     * （这个 bug 真实存在过，绕了好一圈才在控制台里看见。）
+     */
+    const s = plain(source)
+    keptPassword.value = s.password ?? ''
+    keptPassphrase.value = s.passphrase ?? ''
+    Object.assign(form, { ...s, password: '', passphrase: '' })
   } else {
+    keptPassword.value = ''
+    keptPassphrase.value = ''
     Object.assign(form, {
       id: '',
       name: '',
@@ -83,9 +107,11 @@ function resetForm() {
   formRef.value?.clearValidate()
 }
 
+// 同时盯 serverId：对话框已经开着时再切一台（少见，但脚本/快捷键能触发），
+// 只监听 modelValue 的话它一直是 true，不会重置表单，界面上就会停在上一台的数据
 watch(
-  () => props.modelValue,
-  (open) => {
+  () => [props.modelValue, props.serverId] as const,
+  ([open]) => {
     if (open) resetForm()
   }
 )
@@ -121,7 +147,13 @@ async function testConnection() {
   try {
     // 表单是 reactive 对象，跨 IPC 前必须转成普通对象，
     // 否则会报 "An object could not be cloned"
-    const payload = JSON.parse(JSON.stringify({ ...form, id: form.id || 'temp-test' }))
+    const payload = plain({
+      ...form,
+      id: form.id || 'temp-test',
+      // 密码框留空时用已保存的那个，否则"测试连接"会因为空密码而认证失败
+      password: form.password || keptPassword.value,
+      passphrase: form.passphrase || keptPassphrase.value
+    })
     const sessionId = await window.api.ssh.connect(payload, 80, 24)
     await window.api.ssh.disconnect(sessionId)
     ElMessage.success('连接成功，认证通过')
@@ -138,6 +170,9 @@ async function submit() {
 
   const payload: ServerConfig = {
     ...form,
+    // 留空 = 沿用原密码，直接提交空串会把已经存好的密码清掉
+    password: form.password || keptPassword.value,
+    passphrase: form.passphrase || keptPassphrase.value,
     name: form.name.trim(),
     host: form.host.trim(),
     username: form.username.trim(),
@@ -209,7 +244,7 @@ async function submit() {
             v-model="form.password"
             type="password"
             show-password
-            placeholder="登录密码（本地加密保存）"
+            :placeholder="isEdit && keptPassword ? '已保存（留空则不修改）' : '登录密码（本地加密保存）'"
           />
         </el-form-item>
       </template>
@@ -230,7 +265,12 @@ async function submit() {
           </div>
         </el-form-item>
         <el-form-item label="私钥口令">
-          <el-input v-model="form.passphrase" type="password" show-password placeholder="私钥无口令可留空" />
+          <el-input
+            v-model="form.passphrase"
+            type="password"
+            show-password
+            :placeholder="isEdit && keptPassphrase ? '已保存（留空则不修改）' : '私钥无口令可留空'"
+          />
         </el-form-item>
       </template>
 

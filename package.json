@@ -20,7 +20,9 @@
     "dist:mac": "node scripts/dist.mjs mac",
     "manifest": "node scripts/make-manifest.mjs",
     "manifest:gh": "node scripts/make-manifest.mjs --gh ElvisZhang0/ThShell",
-    "check:release": "node scripts/check-release.mjs"
+    "check:release": "node scripts/check-release.mjs",
+    "test:update": "node scripts/update-e2e.mjs",
+    "test:dialog": "node scripts/dialog-e2e.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",

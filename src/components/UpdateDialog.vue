@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, watch } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { useAppStore } from '../stores/app'
 import { formatSize, formatSpeed } from '../utils/transfer-format'
 import {
   cancelDownload,
   feedLabel,
   runCheck,
-  runDownload,
-  runInstall,
+  runUpgrade,
   updateState
 } from '../utils/update-state'
 
@@ -53,13 +53,33 @@ async function retry(): Promise<void> {
   await runCheck(feed.value)
 }
 
-async function download(): Promise<void> {
-  await runDownload()
+/**
+ * 一次点击走完「下载 → 校验 → 拉起安装程序」。
+ * 下载完还要用户再点一次「安装」这件事没有任何决策价值，只是多一步。
+ *
+ * 唯一会拦一下的情况：还有传输在跑。Windows 上安装要先退出应用，
+ * 正在传的文件会断在半截 —— 这个代价用户事先不知道，得让他自己决定。
+ */
+async function upgrade(): Promise<void> {
+  const running = store.transfers.filter((t) => !t.done).length
+  if (running > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `还有 ${running} 个传输在进行。升级需要先关闭 ThShell，这些传输会中断（已传的部分会保留，下次可以重传）。`,
+        '确认现在升级？',
+        { confirmButtonText: '仍然升级', cancelButtonText: '等它们传完', type: 'warning' }
+      )
+    } catch {
+      return
+    }
+  }
+  await runUpgrade()
 }
 
-async function install(): Promise<void> {
-  await runInstall()
-}
+/** 启动安装程序后被禁用：防止在应用退出前连点，起两个安装进程互抢文件 */
+const busy = computed(
+  () => updateState.downloading || updateState.installing || updateState.launched
+)
 </script>
 
 <template>
@@ -96,7 +116,8 @@ async function install(): Promise<void> {
         <template v-else>
           <div class="row muted">{{ assetLabel }}</div>
 
-          <div v-if="updateState.downloading" class="progress">
+          <!-- 安装阶段也留着这条：进度条突然消失会让人以为下载白跑了 -->
+          <div v-if="updateState.downloading || updateState.installing" class="progress">
             <el-progress :percentage="pct" :stroke-width="6" :show-text="false" />
             <div class="pmeta">
               <span class="mono">
@@ -108,9 +129,12 @@ async function install(): Promise<void> {
             </div>
           </div>
 
-          <div v-if="updateState.filePath" class="row ok">已下载到本地，可以安装了。</div>
           <div v-if="updateState.message" class="row ok">{{ updateState.message }}</div>
           <div v-if="updateState.error" class="row warn">{{ updateState.error }}</div>
+          <!-- 自动安装失败时的退路：包已经校验完躺在本地，重试不必再下一遍 -->
+          <div v-if="updateState.error && updateState.filePath" class="row muted">
+            安装包已下载：<span class="mono elide">{{ updateState.filePath }}</span>
+          </div>
         </template>
       </template>
 
@@ -132,22 +156,19 @@ async function install(): Promise<void> {
         </el-button>
 
         <template v-if="r?.hasUpdate && r.asset && !r.unsupported">
-          <el-button
-            v-if="updateState.downloading"
-            size="small"
-            @click="cancelDownload"
-          >
+          <el-button v-if="updateState.downloading" size="small" @click="cancelDownload">
             取消下载
           </el-button>
           <el-button
-            v-else-if="!updateState.filePath"
+            v-else
             type="primary"
             size="small"
-            @click="download"
+            :loading="updateState.installing"
+            :disabled="busy"
+            @click="upgrade"
           >
-            下载
+            {{ updateState.launched ? '正在安装' : `升级到 ${r.latest}` }}
           </el-button>
-          <el-button v-else type="primary" size="small" @click="install">安装</el-button>
         </template>
 
         <el-button size="small" @click="visible = false">关闭</el-button>

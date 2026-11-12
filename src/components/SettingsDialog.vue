@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Download, InfoFilled } from '@element-plus/icons-vue'
 import { useAppStore, cleanError } from '../stores/app'
+import { plain } from '../utils/plain'
 import type { AppSettings } from '../../electron/types'
 
 const props = defineProps<{ modelValue: boolean }>()
@@ -47,8 +48,10 @@ watch(
   () => props.modelValue,
   async (open) => {
     if (open) {
-      // 每次打开重新拍快照：设置项即时预览，取消时要能还原
-      snapshot = structuredClone(store.config.settings)
+      // 每次打开重新拍快照：设置项即时预览，取消时要能还原。
+      // 用 plain 而不是 structuredClone —— store.config.settings 是响应式 Proxy，
+      // 结构化克隆会抛 DataCloneError（和「编辑连接不回显」是同一个坑）
+      snapshot = plain(store.config.settings)
       saved = false
       try {
         version.value = await window.api.app.version()
