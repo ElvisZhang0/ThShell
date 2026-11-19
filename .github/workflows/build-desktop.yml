@@ -56,6 +56,15 @@ jobs:
       # 前端 + 主进程一起构建（vue-tsc 顺带做类型检查，类型错就不出包）
       - run: pnpm build
 
+      # `--linux rpm` 最终要调 rpmbuild，ubuntu-latest 的镜像里默认没有它。
+      # 少了这一行的表现很坑：AppImage / deb / tar.gz 全打成功，只在 rpm 那一步
+      # 抛 `rpmbuild failed (exit code 1)`，而且错误被埋在十几行 info 后面。
+      - name: 安装 Linux 打包依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
       - name: 打包
         id: pack
         shell: bash
