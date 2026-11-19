@@ -57,10 +57,26 @@ jobs:
       - run: pnpm build
 
       - name: 打包
-        run: npx electron-builder ${{ matrix.args }} --publish never
+        id: pack
+        shell: bash
+        run: |
+          set -o pipefail
+          npx electron-builder ${{ matrix.args }} --publish never 2>&1 | tee "$RUNNER_TEMP/pack.log"
         env:
           # 没有签名证书：显式告诉 electron-builder 别去找钥匙串
           CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      # 失败时把最后几十行用 `::error::` 吐成 annotation。
+      # 原因很实际：Actions 的完整日志要登录才能看，annotation 走 check-runs API
+      # 是匿名可读的 —— 远程排查发版失败时，这是唯一能拿到错误文本的通道。
+      - name: 失败诊断
+        if: failure() && steps.pack.outcome == 'failure'
+        shell: bash
+        run: |
+          tail -n 40 "$RUNNER_TEMP/pack.log" | tr -d '\r' | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
