@@ -66,14 +66,24 @@ jobs:
           # 没有签名证书：显式告诉 electron-builder 别去找钥匙串
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
-      # 失败时把最后几十行用 `::error::` 吐成 annotation。
+      # 失败时把日志用 `::error::` 吐成 annotation。
       # 原因很实际：Actions 的完整日志要登录才能看，annotation 走 check-runs API
       # 是匿名可读的 —— 远程排查发版失败时，这是唯一能拿到错误文本的通道。
+      #
+      # 分三段取：① 总行数（判断日志有没有被截断）② 所有错误关键字行 ③ 末尾 20 行。
+      # 上一版只 tail 40 行，结果拿回来全是 info 行、没有任何 ⨯ —— 说明失败可能是
+      # 进程被信号杀掉（OOM）而不是报错，那这种情况只能靠总行数和末尾对照着判断。
       - name: 失败诊断
         if: failure() && steps.pack.outcome == 'failure'
         shell: bash
         run: |
-          tail -n 40 "$RUNNER_TEMP/pack.log" | tr -d '\r' | while IFS= read -r line; do
+          LOG="$RUNNER_TEMP/pack.log"
+          echo "::error::pack.log 共 $(wc -l < "$LOG" 2>/dev/null || echo 0) 行"
+          grep -nEi "⨯|ERR_|error|failed|exit code|killed|signal|ENOSPC|ENOMEM" "$LOG" | tail -n 25 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          echo "::error::===== 末尾 20 行 ====="
+          tail -n 20 "$LOG" | while IFS= read -r line; do
             echo "::error::$line"
           done
           exit 0
