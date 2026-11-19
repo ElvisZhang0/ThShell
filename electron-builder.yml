@@ -23,11 +23,16 @@ files:
   - resources/**/*
   # cpu-features 是可选的加密加速绑定，没编译出来 ssh2 会回退纯 JS，不必塞进包
   - '!**/node_modules/cpu-features/**'
+  # node-pty 的 pdb 是调试符号，一个 6MB，两个就 12MB，运行完全用不到
+  - '!**/node_modules/node-pty/**/*.pdb'
 
-# ssh2 的原生 .node 必须留在 asar 外面，asar 里的动态库 dlopen 不了
+# 原生模块的 .node / .dll 必须留在 asar 外面，asar 里的动态库 dlopen 不了。
+# node-pty 尤其要注意：除了 pty.node，Windows 上还要 conpty.dll、OpenConsole.exe、
+# winpty-agent.exe 与 .node 放在同一棵目录树里 —— 所以整包 un，不要只挑 .node。
 asarUnpack:
   - '**/node_modules/ssh2/**'
   - '**/node_modules/cpu-features/**'
+  - '**/node_modules/node-pty/**'
 
 # 不在打包时重编原生模块：仓库里没有 vs 工具链，重编必失败
 npmRebuild: false

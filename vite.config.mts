@@ -50,9 +50,11 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             minify: false,
-            // ssh2 / cpu-features 是原生/可选原生模块，必须保持 require，不能被打包
+            // ssh2 / cpu-features 是原生/可选原生模块，必须保持 require，不能被打包。
+            // node-pty 同理：它要加载 build 目录里的 .node 和 conpty.dll，
+            // 被 rollup 内联进 main.js 之后 __dirname 会指错，PTY 直接起不来。
             rollupOptions: {
-              external: ['ssh2', 'cpu-features', 'electron'],
+              external: ['ssh2', 'cpu-features', 'node-pty', 'electron'],
               output: {
                 format: 'cjs',
                 entryFileNames: 'main.js',

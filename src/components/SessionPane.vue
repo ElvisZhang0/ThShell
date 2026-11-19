@@ -20,12 +20,20 @@ import DockerPanel from './DockerPanel.vue'
 const props = defineProps<{ tab: Tab }>()
 const store = useAppStore()
 
+const isLocal = computed(() => props.tab.kind === 'local')
+
 const views: { key: ViewKind; label: string; icon: typeof Monitor }[] = [
   { key: 'terminal', label: '终端', icon: Monitor },
   { key: 'files', label: '文件', icon: FolderOpened },
   { key: 'monitor', label: '监控', icon: Odometer },
   { key: 'system', label: '系统', icon: Cpu }
 ]
+
+/**
+ * 本地终端只有终端这一页：文件/监控/系统都是靠 SSH 在远端执行命令采回来的，
+ * 本机没有那条通道 —— 摆一排点不动的页签比不摆更糟。
+ */
+const shownViews = computed(() => (isLocal.value ? views.slice(0, 1) : views))
 
 /**
  * 「容器」页签只在远程机器装了 docker 时才出现。
@@ -35,7 +43,7 @@ const hasDocker = ref(false)
 watch(
   () => props.tab.sessionId,
   async (sessionId) => {
-    if (!sessionId) {
+    if (!sessionId || isLocal.value) {
       hasDocker.value = false
       return
     }
@@ -51,15 +59,25 @@ watch(
   { immediate: true }
 )
 
-const live = computed(() => props.tab.status === 'connected' && !!props.tab.sessionId)
+/**
+ * 本地终端退出后仍然保留 xterm：屏幕上还有刚才的输出可以翻，
+ * 切到"已断开"的整屏提示反而把最后那几行日志藏起来了。
+ * 远程不行 —— SSH 断了之后 xterm 里没有任何东西再更新，也拿不到重连前的输出。
+ */
+const live = computed(() =>
+  isLocal.value
+    ? !!props.tab.sessionId
+    : props.tab.status === 'connected' && !!props.tab.sessionId
+)
 </script>
 
 <template>
   <div class="session-pane">
     <div class="pane-head">
-      <div class="seg">
+      <!-- 本地终端只有一个视图，切换条留着只会占地方 -->
+      <div v-if="!isLocal" class="seg">
         <button
-          v-for="view in views"
+          v-for="view in shownViews"
           :key="view.key"
           class="seg-btn"
           :class="{ active: tab.view === view.key }"
@@ -87,9 +105,13 @@ const live = computed(() => props.tab.status === 'connected' && !!props.tab.sess
         <span class="status-text" :class="tab.status">
           {{
             tab.status === 'connected'
-              ? '已连接'
+              ? isLocal
+                ? '本地'
+                : '已连接'
               : tab.status === 'connecting'
-                ? '连接中…'
+                ? isLocal
+                  ? '启动中…'
+                  : '连接中…'
                 : tab.status === 'error'
                   ? '连接失败'
                   : '已断开'
@@ -111,25 +133,37 @@ const live = computed(() => props.tab.status === 'connected' && !!props.tab.sess
     <div class="pane-body">
       <template v-if="live">
         <TerminalView v-show="tab.view === 'terminal'" :tab="tab" />
-        <FileManager v-show="tab.view === 'files'" :tab="tab" />
-        <MonitorPanel v-show="tab.view === 'monitor'" :tab="tab" />
-        <SystemPanel v-show="tab.view === 'system'" :tab="tab" />
-        <DockerPanel v-if="hasDocker" v-show="tab.view === 'docker'" :tab="tab" />
+        <template v-if="!isLocal">
+          <FileManager v-show="tab.view === 'files'" :tab="tab" />
+          <MonitorPanel v-show="tab.view === 'monitor'" :tab="tab" />
+          <SystemPanel v-show="tab.view === 'system'" :tab="tab" />
+          <DockerPanel v-if="hasDocker" v-show="tab.view === 'docker'" :tab="tab" />
+        </template>
       </template>
 
       <div v-else class="state-screen">
         <div v-if="tab.status === 'connecting'" class="state-box">
           <div class="spinner" />
-          <h3>正在建立 SSH 连接</h3>
+          <h3>{{ isLocal ? '正在启动本地 shell' : '正在建立 SSH 连接' }}</h3>
           <p class="mono">{{ tab.subtitle }}</p>
         </div>
 
         <div v-else class="state-box">
           <el-icon class="warn-icon"><WarningFilled /></el-icon>
-          <h3>{{ tab.status === 'error' ? '连接失败' : '会话已断开' }}</h3>
+          <h3>
+            {{
+              tab.status === 'error'
+                ? isLocal
+                  ? '本地终端启动失败'
+                  : '连接失败'
+                : isLocal
+                  ? '本地终端已退出'
+                  : '会话已断开'
+            }}
+          </h3>
           <p class="err-msg">{{ tab.message || '与服务器的连接已关闭' }}</p>
           <el-button type="primary" :icon="RefreshRight" @click="store.reconnect(tab.id)">
-            重新连接
+            {{ isLocal ? '重新打开' : '重新连接' }}
           </el-button>
         </div>
       </div>

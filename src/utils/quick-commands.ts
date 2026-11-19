@@ -75,14 +75,15 @@ export const QUICK_GROUPS: QuickGroup[] = [
     label: '磁盘与文件',
     commands: [
       {
-        cmd: 'df -h',
-        desc: '各分区容量与使用率',
+        cmd: 'df -hT',
+        desc: '各分区容量、使用率与文件系统类型',
+        note: 'T 是多一列类型。看到 xfs 和 ext4 要分开处理 —— xfs 只能扩不能缩；/dev/loop 挂着的多半是 snap 包，不是真分区',
         hot: true
       },
       {
         cmd: 'df -i',
         desc: 'inode 使用率',
-        note: '报"空间不足"但 df -h 还有余量时，多半是小文件把 inode 用完了'
+        note: '报"空间不足"但 df -hT 还有余量时，多半是小文件把 inode 用完了 —— 每个文件占一个 inode，几十万个小文件就能把 inode 吃光，此时硬盘还有空也不让写'
       },
       {
         cmd: 'du -sh * | sort -h',
@@ -96,11 +97,6 @@ export const QUICK_GROUPS: QuickGroup[] = [
         note: '2>/dev/null 是为了吃掉 /proc、/sys 的权限报错'
       },
       {
-        cmd: 'lsblk',
-        desc: '块设备与分区树',
-        note: '看新挂的盘有没有识别、是不是做了 LVM'
-      },
-      {
         cmd: 'find / -xdev -size +500M -type f 2>/dev/null',
         desc: '全盘找出 500MB 以上的文件',
         note: '-xdev 不跨文件系统，避免钻进挂载进来的网络盘/NAS'
@@ -109,6 +105,80 @@ export const QUICK_GROUPS: QuickGroup[] = [
         cmd: 'ls -alh',
         desc: '当前目录详细列表（含隐藏文件）',
         hot: true
+      }
+    ]
+  },
+  {
+    label: '磁盘管理',
+    commands: [
+      {
+        cmd: 'lsblk -f',
+        desc: '块设备树、文件系统与挂载点',
+        note: '一眼看出新挂的云盘有没有分区、有没有格式化。MOUNTPOINT 空着就是没挂上；FSTYPE 空着是还没格式化',
+        hot: true
+      },
+      {
+        cmd: 'lsof +L1',
+        desc: '已删除但仍被进程占用的文件',
+        note: '磁盘明明删了东西却不降，答案基本都在这。进程还开着句柄，df 就永远不释放；重启那个进程才真正回收（PostgreSQL 的 WAL、被 rm 的日志最典型）',
+        hot: true
+      },
+      {
+        cmd: 'vgs && lvs',
+        desc: 'LVM 卷组与逻辑卷的剩余空间',
+        note: '阿里云 ECS 常见 LVM 布局。VFree 才是还没分出去的余量；LV 那列是逻辑卷大小，跟文件系统大小不是一回事 —— 中间差着一步 xfs_growfs/resize2fs'
+      },
+      {
+        cmd: 'xfs_growfs /',
+        desc: '让文件系统认到扩容后的新容量',
+        note: 'xfs 用 xfs_growfs（只能扩不能缩），ext4 用 resize2fs。看 df -hT 的 TYPE 列决定用哪个。扩容是「控制台扩云盘 → 扩分区 → 扩文件系统」三步，少一步 df 都不变',
+        mode: 'fill'
+      },
+      {
+        cmd: 'findmnt -T ',
+        desc: '这个目录实际落在哪个分区上',
+        note: '末尾补路径，比如 /var/lib/docker。排查"明明扩过盘怎么还满"——多半扩的不是它所在的那块',
+        mode: 'fill'
+      },
+      {
+        cmd: 'iostat -x 1 3',
+        desc: '每块盘的 IO 压力明细',
+        note: '看 %util（接近 100% 说明盘已经跑到极限）和 await（每次 IO 平均等多少 ms，超过 20 就该怀疑盘或队列）。没这条命令是没装 sysstat：yum install -y sysstat'
+      },
+      {
+        cmd: 'iotop -bn1 -o | head -20',
+        desc: '哪个进程正在读写磁盘',
+        note: '-o 只列真正有 IO 的，-b 批处理不交互。不加 sudo 看不到别人的进程，只能看到自己的'
+      },
+      {
+        cmd: 'du -xhd1 /var 2>/dev/null | sort -h',
+        desc: '/var 下各目录占用排序',
+        note: '-x 不跨文件系统，-d1 只下一层。把 /var 换成 /home、/opt 同样用；sort 要用 -h，用 -n 会把 1.2G 和 900K 排错'
+      },
+      {
+        cmd: 'journalctl --disk-usage',
+        desc: '系统日志现在占了多少',
+        note: '占几百 MB 到几个 G 都算常态。清理用 journalctl --vacuum-size=200M（保留最近 200MB），别直接 rm 目录里的文件'
+      },
+      {
+        cmd: 'find /var/log -type f -size +100M -exec ls -lh {} +',
+        desc: '找出超过 100MB 的日志文件',
+        note: '只扫 /var/log，别全盘 find（很慢）。确认没在写之后用 truncate -s 0 清空，不要 rm —— rm 了进程还持有句柄，空间照样不释放（见 lsof +L1）'
+      },
+      {
+        cmd: 'blkid',
+        desc: '各分区的 UUID 与文件系统类型',
+        note: '往 /etc/fstab 里写 UUID 时来这里抄。没输出的分区是还没格式化；UUID 比 /dev/sdb 可靠，设备名会随挂载顺序变'
+      },
+      {
+        cmd: 'cat /etc/fstab',
+        desc: '开机自动挂载配置',
+        note: '改错了会开不了机。加盘之后要在这里补一行；写完先跑 mount -a 试一遍，这时候报错还来得及改'
+      },
+      {
+        cmd: 'smartctl -a /dev/sda',
+        desc: '磁盘健康状态与坏道计数',
+        note: '云盘基本读不到 —— KVM/Xen 不把 SMART 接口暴露给虚拟机，报 "Operation not supported" 是正常的，不代表盘坏了。这条只在物理机上用得上'
       }
     ]
   },
@@ -158,12 +228,39 @@ export const QUICK_GROUPS: QuickGroup[] = [
         desc: '各状态连接数统计',
         note: 'TIME-WAIT 特别多，说明短连接太频繁或者没开复用'
       },
-      { cmd: 'ip a', desc: '网卡与 IP 地址' },
-      { cmd: 'ip route', desc: '路由表与默认网关' },
+      {
+        cmd: 'ss -tan state established | head -30',
+        desc: '已建立的连接（谁连着本机）',
+        note: '排查"谁在连我的数据库"：加 | grep 5432 过滤。Local 是本地端、Peer 是远端，看 Peer 就知道是哪台机器'
+      },
+      {
+        cmd: 'ip a',
+        desc: '网卡与 IP 地址'
+      },
+      {
+        cmd: 'ip -s link',
+        desc: '各网卡的收发包、丢包与错误计数',
+        note: '重点看 dropped 和 errors 两列。网卡跑满时 dropped 会涨（缓冲区不够）；errors 涨说明物理层或驱动有问题，跟程序无关'
+      },
+      {
+        cmd: 'ip route',
+        desc: '路由表与默认网关'
+      },
+      {
+        cmd: 'ip route get 8.8.8.8',
+        desc: '到某个地址会走哪条路由、从哪块网卡出',
+        note: '多网卡、双默认路由时最有用 —— 它直接告诉你内核的选择，末尾 src 就是选中的源地址。把地址换成对端 IP',
+        mode: 'fill'
+      },
+      {
+        cmd: 'ip neigh',
+        desc: 'ARP 邻居表',
+        note: '同网段连不上时看这里。状态是 FAILED / INCOMPLETE 说明 ARP 没通：IP 冲突、交换机隔离、或者对端根本没开'
+      },
       {
         cmd: 'cat /etc/resolv.conf',
         desc: 'DNS 服务器配置',
-        note: '网络通但域名解析不了，先看这里'
+        note: '网络通但域名解析不了，先看这里。系统开了 systemd-resolved 的话这个文件是自动生成的，要改得用 resolvectl'
       },
       {
         cmd: 'ping -c 4 223.5.5.5',
@@ -175,6 +272,54 @@ export const QUICK_GROUPS: QuickGroup[] = [
         desc: '查某个端口被谁占用',
         note: '把 8080 换成要查的端口；没装 lsof 时用 ss -tunlp 顶',
         mode: 'fill'
+      }
+    ]
+  },
+  {
+    label: '网络诊断',
+    commands: [
+      {
+        cmd: 'mtr -rwc 10 223.5.5.5',
+        desc: '逐跳丢包与延迟（比 traceroute 准）',
+        note: '-r 报告模式 -w 宽输出 -c 10 每跳测 10 次。某一跳丢包但后面几跳不丢 = 那台只是不回 ICMP，不算故障；要装：yum install -y mtr'
+      },
+      {
+        cmd: 'curl -sS -o /dev/null -w "dns=%{time_namelookup} conn=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\\n" http://example.com',
+        desc: '一次 HTTP 请求慢在哪一段',
+        note: 'dns 大 = 解析慢；conn 大 = 网络 RTT 高或对端 backlog 满；ttfb 大 = 服务端处理慢，跟网络无关。把 URL 换成自己的接口',
+        mode: 'fill'
+      },
+      {
+        cmd: 'tcpdump -i any -nn -c 20 port 8080',
+        desc: '抓 20 个包看看通不通',
+        note: '要 root；-c 限数量必加，不然满屏滚不停。只有出去的 SYN 没有回来的 SYN-ACK，说明对端没监听或被防火墙/安全组挡了',
+        mode: 'fill'
+      },
+      {
+        cmd: 'firewall-cmd --list-all',
+        desc: '本机防火墙放行了哪些端口',
+        note: 'CentOS 7+/RHEL 系是 firewalld，Ubuntu 用 ufw status。两边都开着、本机规则也放行了还不通，就去云控制台看安全组 —— 那一层在机器里完全看不到'
+      },
+      {
+        cmd: 'iptables -L INPUT -n -v --line-numbers',
+        desc: '防火墙规则和每条命中次数',
+        note: 'pkts 一列全是 0 说明这些规则一条都没匹配上，问题不在 iptables。规则多时按左侧行号用 -D INPUT 3 删'
+      },
+      {
+        cmd: 'sar -n DEV 1 3',
+        desc: '各网卡每秒吞吐',
+        note: 'rxkB/s、txkB/s 是每秒字节数。云主机带宽通常封顶在 100Mbps 或 1Gbps（约 12.5MB/s、125MB/s），打满就是瓶颈。没装 sysstat 时用 iftop'
+      },
+      {
+        cmd: 'dig +short github.com',
+        desc: '域名解析成什么 IP',
+        note: '比 nslookup 干净，只出结果。要指定 DNS 服务器写成 dig +short github.com @223.5.5.5；解析不出来但直接 ping IP 能通，就是 DNS 的问题',
+        mode: 'fill'
+      },
+      {
+        cmd: 'conntrack -C',
+        desc: '连接跟踪表当前条目数',
+        note: '只有做 NAT / 网关的机器才关心。接近上限会开始丢新连接，日志里是 "nf_conntrack: table full"。上限看 cat /proc/sys/net/netfilter/nf_conntrack_max'
       }
     ]
   },

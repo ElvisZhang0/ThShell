@@ -18,6 +18,8 @@ dist-electron/
 # 一次打包就 900MB+，绝不能进仓库
 release/
 release-win/
+# electron-builder 的临时输出目录（--dir 出免安装版做验证用，名字带后缀）
+release-dir/
 *.blockmap
 builder-debug.yml
 

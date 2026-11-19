@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { ConfigStore } from './modules/config-store'
 import { SshManager } from './modules/ssh-manager'
+import { LocalShellManager } from './modules/local-shell'
 import { clearMetricsState, collectMetrics } from './modules/metrics'
 import { collectSystemInfo } from './modules/sysinfo'
 import {
@@ -92,6 +93,16 @@ function safeSend(channel: string, payload: unknown): void {
 const ssh = new SshManager(
   (payload) => safeSend('ssh:data', payload),
   (payload) => safeSend('ssh:state', payload)
+)
+
+/**
+ * 本地终端（本机 shell）。
+ * 事件走独立通道（shell:data / shell:exit），不跟 ssh 混：
+ * ssh 的 payload 里有 serverId，本地终端没有，硬塞会导致渲染层到处判空。
+ */
+const localShell = new LocalShellManager(
+  (payload) => safeSend('shell:data', payload),
+  (payload) => safeSend('shell:exit', payload)
 )
 
 /** 统一把异常转成前端可直接展示的中文消息 */
@@ -187,6 +198,27 @@ function createWindow(): void {
    */
   if (process.env.THSHELL_SMOKE) {
     const mode = process.env.THSHELL_SMOKE
+    /**
+     * 打包版（GUI 子系统）没有 stdout：`ThShell.exe` 双击起来的进程不挂控制台，
+     * console.log 全丢，跑冒烟只能看到"静默退出"，分不清是崩了还是断言失败。
+     * 所以冒烟期间把 console 的输出同时镜像一份到临时文件 ——
+     * 验证 asarUnpack 之后 node-pty 还活不活着，只能靠这条路。
+     */
+    const smokeLogPath = path.join(os.tmpdir(), `thshell-smoke-${mode}.log`)
+    try {
+      fs.writeFileSync(smokeLogPath, '')
+    } catch {
+      /* 写不了就只靠 stdout */
+    }
+    const rawLog = console.log.bind(console)
+    console.log = (...args: unknown[]) => {
+      rawLog(...args)
+      try {
+        fs.appendFileSync(smokeLogPath, args.map((a) => String(a)).join(' ') + '\n')
+      } catch {
+        /* 镜像失败不影响冒烟本身 */
+      }
+    }
     mainWindow.webContents.once('did-finish-load', async () => {
       const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
       const js = (code: string) => mainWindow!.webContents.executeJavaScript(code)
@@ -241,6 +273,13 @@ function createWindow(): void {
         } catch {
           /* 已经断了就算了 */
         }
+        // 本地 shell 是真进程：冒烟是 app.exit(0) 硬退，不走 window-all-closed，
+        // 不在这里收一遍就会在机器上留一堆 pwsh
+        try {
+          localShell.closeAll()
+        } catch {
+          /* 同上 */
+        }
         app.exit(0)
       }
 
@@ -279,7 +318,10 @@ function createWindow(): void {
         await shot('01-welcome.png')
 
         // 新建连接弹窗
-        await js(`document.querySelectorAll('.actions .el-button')[0]?.click()`)
+        // 新建连接弹窗（按文案点，不按下标 —— 标题栏前面还会继续加按钮）
+        await js(
+          `[...document.querySelectorAll('.actions .el-button')].find((b) => b.textContent.includes('新建连接'))?.click()`
+        )
         await wait(900)
         await shot('02-dialog-new-server.png')
         await js(`document.querySelector('.el-dialog__headerbtn')?.click()`)
@@ -2763,15 +2805,475 @@ function createWindow(): void {
       // quick 模式：终端底部的快捷命令栏 + 全部命令浮层。
       // 这类"工具条"的价值全在能不能找到东西，所以要同时验：数量、每条是否带说明、
       // 浮层有没有顶出窗格、fill 类命令是不是真的只写进提示符不回车。
-      if (mode === 'quick') {
+      /**
+       * local 模式：本地终端。
+       *
+       * 这条链路和 SSH 完全无关，专盯着 node-pty / ConPTY 那一层：
+       * 真起了 shell 没有、字节双向通不通、本地特有的几个界面分支对不对。
+       * 不需要任何服务器，所以在哪台机器上都能跑。
+       */
+      if (mode === 'local') {
         await wait(1500)
-        await js(
-          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
-        )
-        await wait(4000)
 
         const checks: [string, boolean, string][] = []
         const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        /** 当前可见终端里最后 n 行非空文本 */
+        const lastRows = async (n: number) =>
+          (await js(`(() => {
+            const pane = [...document.querySelectorAll('.session-pane')]
+              .filter((p) => p.getBoundingClientRect().width > 0).pop()
+            if (!pane) return []
+            const rows = [...pane.querySelectorAll('.xterm-rows > div')]
+              .map((d) => (d.textContent || '').replace(/\\u00a0/g, ' ').trimEnd())
+              .filter((r) => r.trim())
+            return rows.slice(-${n})
+          })()`)) as string[]
+
+        const tabTitles = async () =>
+          (await js(
+            `[...document.querySelectorAll('.tab-title')].map((t) => t.textContent.trim())`
+          )) as string[]
+
+        // 1. 按钮存在，且在「新建连接」左边（用户明确要求的位置）
+        const layout = (await js(`(() => {
+          const btns = [...document.querySelectorAll('.actions .el-button')]
+          const local = btns.find((b) => b.textContent.includes('终端'))
+          const remote = btns.find((b) => b.textContent.includes('新建连接'))
+          if (!local || !remote) return { found: false }
+          return {
+            found: true,
+            localLeft: Math.round(local.getBoundingClientRect().left),
+            remoteLeft: Math.round(remote.getBoundingClientRect().left)
+          }
+        })()`)) as { found: boolean; localLeft?: number; remoteLeft?: number }
+        push('标题栏有「终端」按钮', layout.found)
+        if (layout.found) {
+          push(
+            '「终端」排在「新建连接」左边',
+            (layout.localLeft ?? 0) < (layout.remoteLeft ?? 0),
+            `${layout.localLeft} < ${layout.remoteLeft}`
+          )
+        }
+
+        // 2. 点开一个本地终端
+        const clickLocal = `[...document.querySelectorAll('.actions .el-button')]
+          .find((b) => b.textContent.includes('终端'))?.click()`
+        await js(clickLocal)
+        /**
+         * 派发一次 resize：新页签是插入的，xterm 的 FitAddon 依赖容器尺寸，
+         * 偶尔拿到的是"插入前"的 0 宽，行就不渲染 —— 表现成"页签有了但终端是空的"。
+         * 这一下不改变产品行为，只是让冒烟里的首次 fit 一定发生。
+         */
+        await wait(700)
+        await js(`window.dispatchEvent(new Event('resize'))`)
+
+        /**
+         * 分两段等：先等页签出现（证明点击生效），再等提示符（证明 shell 真起来了）。
+         * 合成一个"15 秒没提示符"的话，分不清是没点开、没 spawn 出来、还是输出没画到 DOM ——
+         * 这三种原因排查方向完全不同。
+         */
+        let tabOpened = false
+        for (let i = 0; i < 16; i += 1) {
+          await wait(250)
+          if ((await tabTitles()).some((t) => t.includes('本地终端'))) {
+            tabOpened = true
+            break
+          }
+        }
+        push('点开后立刻出现「本地终端」页签', tabOpened, (await tabTitles()).join(' | '))
+
+        // 拿 sessionId：从 store 里读，和 xterm 有没有渲染无关
+        let sid = ''
+        for (let i = 0; i < 20; i += 1) {
+          await wait(250)
+          sid = (await js(`(() => {
+            const t = window.__store.tabs.filter((x) => x.kind === 'local').pop()
+            return t ? t.sessionId : ''
+          })()`)) as string
+          if (sid) break
+        }
+        push('主进程给出了本地 sessionId', !!sid, sid ? sid.slice(0, 8) : '空')
+
+        /**
+         * "shell 活没活"看主进程侧的字节数：这是硬证据，跟窗口焦点、xterm 有没有
+         * 把字符画进 DOM 全不相干。之前拿 DOM 行做判据，跑连组时偶尔会红 ——
+         * 红的是"渲染时机"，不是 shell。
+         */
+        let shellAlive = false
+        for (let i = 0; i < 40; i += 1) {
+          await wait(250)
+          if (sid && localShell.bytesOf(sid) > 0) {
+            shellAlive = true
+            break
+          }
+        }
+        push(
+          '本地 shell 真的活着（有输出字节）',
+          shellAlive,
+          sid ? `${localShell.bytesOf(sid)} 字节` : '没拿到 sessionId'
+        )
+
+        // 界面这一层单独一条：主进程有输出但 xterm 没画出来，是另一个性质的问题
+        let painted = false
+        for (let i = 0; i < 20; i += 1) {
+          await wait(300)
+          if ((await lastRows(3)).length > 0) {
+            painted = true
+            break
+          }
+        }
+        push('提示符画到了界面上', painted, painted ? '' : '主进程有输出，但 xterm 里没有文本行')
+
+        if (!shellAlive) {
+          for (const [name, ok, detail] of checks)
+            console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+          console.log('[smoke] local shell 没起来，后面的断言跳过')
+          finish()
+          return
+        }
+
+        // 3. 本地终端不该带 SSH 的那几件套
+        const paneStats = (await js(`(() => {
+          const panes = [...document.querySelectorAll('.session-pane')]
+            .filter((p) => p.getBoundingClientRect().width > 0)
+          const pane = panes[panes.length - 1]
+          if (!pane) return { quick: -1, seg: -1, status: '' }
+          return {
+            quick: pane.querySelectorAll('.quick-bar').length,
+            seg: pane.querySelectorAll('.pane-head .seg').length,
+            status: (pane.querySelector('.status-text')?.textContent || '').trim()
+          }
+        })()`)) as { quick: number; seg: number; status: string }
+        push('本地终端不显示快捷命令栏', paneStats.quick === 0, `找到 ${paneStats.quick} 条`)
+        push('本地终端不显示视图切换条', paneStats.seg === 0, `${paneStats.seg} 条`)
+        push('状态显示「本地」', paneStats.status === '本地', paneStats.status || '空')
+
+        // 4. 双向通：往 PTY 写一条命令，看它原样回显并执行。
+        //
+        //    这里**不用** sendInputEvent 合成按键：那条路依赖窗口有焦点，
+        //    连续跑几组冒烟时焦点常被前一个进程抢走，输入直接丢半截 ——
+        //    表现成"命令没执行"，很容易被当成 PTY 的锅。
+        //    改成走真实 IPC 写字节：xterm → IPC → PTY 的上行只差
+        //    xterm 自己的键盘绑定（那部分由 xterm 保证），下行整条链都是真的。
+        //    sessionId 用上面从 store 取到的那个，不再重复读 DOM。
+        const runInShell = async (command: string) => {
+          await js(
+            `window.api.shell.write(${JSON.stringify(sid)}, ${JSON.stringify(command + '\r')})`
+          )
+        }
+
+        await runInShell('echo THSHELL_LOCAL_OK')
+        let echoed = false
+        for (let i = 0; i < 20; i += 1) {
+          await wait(300)
+          const rows = await lastRows(6)
+          if (rows.some((r) => r.includes('THSHELL_LOCAL_OK'))) {
+            echoed = true
+            break
+          }
+        }
+        const tail = await lastRows(3)
+        push('本机命令能执行（输出回到界面）', echoed, tail.join(' | ').slice(0, 80))
+        if (!echoed) {
+          // 一次把现场摊开：写给了哪个 sid、当前活动页签是哪个、可见终端里有什么行
+          const dump = await js(`(() => {
+            const panes = [...document.querySelectorAll('.session-pane')]
+              .filter((p) => p.getBoundingClientRect().width > 0)
+            const pane = panes[panes.length - 1]
+            return JSON.stringify({
+              active: window.__store.activeTabId,
+              tabs: window.__store.tabs.map((t) => [t.title, t.sessionId.slice(0, 8)]),
+              rows: pane
+                ? [...pane.querySelectorAll('.xterm-rows > div')]
+                    .map((d) => (d.textContent || '').replace(/\\u00a0/g, ' '))
+                    .filter((x) => x.trim())
+                    .slice(-8)
+                : []
+            })
+          })()`)
+          console.log('[smoke] echo 失败现场 ' + dump + ' / 写入 sid=' + sid.slice(0, 8))
+        }
+
+        /**
+         * 中文编码：命令本身全 ASCII，让 shell 自己吐出中文来。
+         * 这是 Windows 上最容易翻车的一处 —— PowerShell 5.1 默认按 GBK 往标准输出写，
+         * xterm 按 UTF-8 解码，中文直接变问号。只测英文的话这个坑永远暴露不了。
+         * pwsh / cmd 上这条语法不成立，跳过并注明。
+         */
+        const shellSub = (await js(`(() => {
+          const t = window.__store.tabs.filter((x) => x.kind === 'local').pop()
+          return t ? t.subtitle : ''
+        })()`)) as string
+
+        // 对齐 IDEA：Windows 上机器里有 PowerShell 就默认用 PowerShell，
+        // 不许悄悄退回 cmd（cmd 没有 PowerShell 的管道/对象能力，用户会立刻察觉）。
+        // 装了 pwsh 7 的还要优先于系统自带的 5.1。
+        const hasPwsh =
+          process.platform === 'win32' &&
+          (fs.existsSync(
+            path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe')
+          ) ||
+            fs.existsSync(
+              path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WindowsApps', 'pwsh.exe')
+            ))
+        const hasWinPs =
+          process.platform === 'win32' &&
+          fs.existsSync(
+            path.join(
+              process.env.SystemRoot || 'C:\\Windows',
+              'System32',
+              'WindowsPowerShell',
+              'v1.0',
+              'powershell.exe'
+            )
+          )
+        const isPowerShell = /pwsh|powershell/i.test(shellSub)
+        push(
+          '有 PowerShell 就默认用它（不落到 cmd）',
+          !(hasPwsh || hasWinPs) || isPowerShell,
+          shellSub || '空'
+        )
+        if (hasPwsh) push('装了 PowerShell 7 优先选它', /PowerShell 7/i.test(shellSub), shellSub || '空')
+
+        if (isPowerShell) {
+          const cnCmd = '[string][char]0x4E2D+[string][char]0x6587'
+          await runInShell(cnCmd)
+          let cnOk = false
+          for (let i = 0; i < 20; i += 1) {
+            await wait(300)
+            if ((await lastRows(6)).some((r) => r.includes('中文'))) {
+              cnOk = true
+              break
+            }
+          }
+          push('中文不乱码', cnOk, (await lastRows(2)).join(' | ').slice(0, 60))
+        } else {
+          push('中文不乱码', true, `跳过：当前 shell 是 ${shellSub || '未知'}`)
+        }
+
+        /**
+         * 目录着色必须跟 PowerShell 原生长得一样：7.x 里 `$PSStyle.FileInfo.Directory`
+         * 默认是「蓝底 + 粗体」（ESC[44;1m），和我们直接开一个 pwsh 窗口看到的一致。
+         *
+         * 这一条以前是反的 —— 启动时用 -Command 覆盖 $PSStyle，把蓝底改成前景蓝，
+         * 为的是浅色主题下别把字压在蓝块上。用户要求还原成 PowerShell 原样，
+         * 断言跟着翻过来：必须**有**背景色。哪天又有人往启动参数里塞 $PSStyle
+         * 覆盖，这条会立刻红。
+         *
+         * 判据用 DOM 的 computed background：xterm 只用类名 xterm-bg-* 表达 ANSI 背景，
+         * 比去猜字节流稳。5.1 默认不吐彩色，所以只在装了 pwsh 7 时断言。
+         */
+        if (hasPwsh) {
+          await runInShell('ls')
+          let listed = false
+          let bgCells = 0
+          let diag = ''
+          for (let i = 0; i < 20; i += 1) {
+            await wait(400)
+            if ((await lastRows(20)).length < 5) continue
+            listed = true
+            const scan = (await js(`(() => {
+              const panes = [...document.querySelectorAll('.session-pane')]
+                .filter((p) => p.getBoundingClientRect().width > 0)
+              const pane = panes[panes.length - 1]
+              if (!pane) return { n: -1, samples: [] }
+              let n = 0
+              const samples = []
+              for (const s of pane.querySelectorAll('.xterm-rows span')) {
+                const bg = getComputedStyle(s).backgroundColor
+                if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') n += 1
+                if (samples.length < 6) {
+                  samples.push((s.className || '-') + '|' + bg + '|' + (s.textContent || '').slice(0, 12))
+                }
+              }
+              return { n, samples }
+            })()`)) as { n: number; samples: string[] }
+            bgCells = scan.n
+            diag = scan.samples.join(' ;; ')
+            if (bgCells > 0) break
+          }
+          push(
+            '目录名保持 PowerShell 原生蓝底',
+            listed && bgCells > 0,
+            !listed
+              ? 'ls 没出结果'
+              : bgCells > 0
+                ? `${bgCells} 个字符带背景色`
+                : // 一个都没有时把头几个 span 的类名/背景色摊开：分得清是"没吐 ANSI"
+                  // 还是"吐了但 xterm 没画"，这两种排查方向完全不同
+                  `0 个字符带背景色 · ${diag}`
+          )
+        } else {
+          push('目录名保持 PowerShell 原生蓝底', true, '跳过：没装 PowerShell 7')
+        }
+
+        /**
+         * PTY 的行列必须和界面上严格一致。
+         *
+         * PowerShell 的 PSReadLine 重绘命令行时用的是**绝对光标定位**
+         * （ESC[行;列H，行号按它自己那份窗口高度算）。两边只要差一行，
+         * 敲下第一个字符时光标就画到提示符上面几行去 —— 用户看到的是"光标乱飞"，
+         * 根子是 resize 没同步给 PTY。这条直接钉根因，比截图肉眼比对可靠。
+         */
+        const ptySize = sid ? localShell.sizeOf(sid) : null
+        const uiSize = (await js(`(() => {
+          const pane = [...document.querySelectorAll('.session-pane')]
+            .filter((p) => p.getBoundingClientRect().width > 0).pop()
+          if (!pane) return null
+          const rows = pane.querySelectorAll('.xterm-rows > div').length
+          const screen = pane.querySelector('.xterm-screen')
+          const ta = pane.querySelector('.xterm-helper-textarea')
+          const cell = ta ? parseFloat(ta.style.width) : 0
+          const cols = screen && cell > 0
+            ? Math.round(screen.getBoundingClientRect().width / cell)
+            : 0
+          return { rows, cols }
+        })()`)) as { rows: number; cols: number } | null
+        push(
+          'PTY 尺寸跟界面一致（否则光标会错行）',
+          !!ptySize && !!uiSize && ptySize.rows === uiSize.rows && ptySize.cols === uiSize.cols,
+          ptySize && uiSize
+            ? `PTY ${ptySize.cols}x${ptySize.rows} / 界面 ${uiSize.cols}x${uiSize.rows}`
+            : '读不到尺寸'
+        )
+
+        /**
+         * 用户报的现象本身：ls 之后敲 cd，光标得留在提示符这一行。
+         * xterm 的隐藏输入框（.xterm-helper-textarea）就是按 buffer 光标定位的，
+         * 拿它的 y 跟最后一行的 y 比 —— 错行的话这里立刻红。
+         */
+        const typeInShell = async (text: string) => {
+          await js(`window.api.shell.write(${JSON.stringify(sid)}, ${JSON.stringify(text)})`)
+        }
+        await typeInShell('cd')
+        await wait(900)
+        const caret = (await js(`(() => {
+          const pane = [...document.querySelectorAll('.session-pane')]
+            .filter((p) => p.getBoundingClientRect().width > 0).pop()
+          if (!pane) return null
+          const rows = [...pane.querySelectorAll('.xterm-rows > div')]
+          const last = rows[rows.length - 1]
+          const ta = pane.querySelector('.xterm-helper-textarea')
+          if (!last || !ta) return null
+          return {
+            lastY: Math.round(last.getBoundingClientRect().y),
+            caretY: Math.round(ta.getBoundingClientRect().y),
+            text: (last.textContent || '').replace(/\\u00a0/g, ' ')
+          }
+        })()`)) as { lastY: number; caretY: number; text: string } | null
+        push(
+          '敲字后光标留在提示符这一行',
+          !!caret && caret.lastY === caret.caretY,
+          caret ? `光标 y=${caret.caretY} / 末行 y=${caret.lastY}` : '读不到光标'
+        )
+        // 把刚敲的 cd 擦掉，后面截图里别留半截命令
+        await typeInShell('\x7f\x7f')
+        // 目录着色是纯视觉项，断言只能证明"有背景色"，观感（蓝块上的字糊不糊、
+        // 深浅两套主题是不是都读得下去）还得看这张图。
+        await shot('thshell-local-ls.png')
+
+        // 5. 再点一次要新开一个，而不是复用第一个
+        await js(clickLocal)
+        let second = false
+        for (let i = 0; i < 20; i += 1) {
+          await wait(400)
+          const t = await tabTitles()
+          if (t.some((x) => x.includes('本地终端 2'))) {
+            second = true
+            break
+          }
+        }
+        push('再点一次开第二个（编号 +1）', second, (await tabTitles()).join(' | '))
+
+        // 6. Ctrl+` 也开一个（终端软件的通用习惯）
+        const before = (await tabTitles()).length
+        await js(
+          `window.dispatchEvent(new KeyboardEvent('keydown', { key: '\`', ctrlKey: true, bubbles: true }))`
+        )
+        let byKey = false
+        for (let i = 0; i < 20; i += 1) {
+          await wait(400)
+          if ((await tabTitles()).length > before) {
+            byKey = true
+            break
+          }
+        }
+        push('Ctrl+` 能新开本地终端', byKey, `${before} → ${(await tabTitles()).length}`)
+
+        // 7. 关页签要把主进程那份会话记录也收掉 —— 漏了就是每开一次留一个 pwsh 进程
+        const closing = (await js(`(() => {
+          const t = window.__store.tabs.filter((x) => x.kind === 'local').pop()
+          return t ? { id: t.id, sid: t.sessionId } : null
+        })()`)) as { id: string; sid: string } | null
+        if (closing) {
+          const known = localShell.has(closing.sid)
+          await js(`window.__store.closeTab(${JSON.stringify(closing.id)})`)
+          await wait(700)
+          push(
+            '关页签后主进程回收了本地 shell',
+            known && !localShell.has(closing.sid),
+            `${closing.sid.slice(0, 8)} ${known ? '开→关' : '（本来就没登记）'}`
+          )
+        } else {
+          push('关页签后主进程回收了本地 shell', false, '没找到本地页签')
+        }
+
+        await wait(600)
+        await shot('thshell-local.png')
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        console.log(`[smoke] local ${failed ? failed + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+
+        localShell.closeAll()
+        finish()
+        return
+      }
+
+      if (mode === 'quick') {
+        await wait(1500)
+
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        /** 终端当前可见的最后 n 行非空文本 */
+        const lastRows = async (n: number) =>
+          (await js(`(() => {
+            const rows = [...document.querySelectorAll('.xterm-rows > div')]
+              .map((d) => (d.textContent || '').replace(/\\u00a0/g, ' ').trimEnd())
+              .filter((r) => r.trim())
+            return rows.slice(-${n})
+          })()`)) as string[]
+
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        /**
+         * 连接是异步的：握手 + 认证 + 起 PTY，内网机器偶尔要十几秒。
+         * 原来固定等 4 秒，慢的时候终端根本没起来，后面每条行为断言都会红，
+         * 而且报出来是"终端是空的"—— 把"没连上"伪装成了"命令没执行"。
+         * 这里等到提示符出现为止，并单独占一条断言，失败点时一眼能看出卡在哪。
+         */
+        let ready = false
+        for (let i = 0; i < 40; i += 1) {
+          await wait(500)
+          if ((await lastRows(3)).length > 0) {
+            ready = true
+            break
+          }
+        }
+        push('终端已连上（有提示符）', ready, ready ? '' : '等了 20 秒终端还是空的，后面的行为断言没意义')
+        if (!ready) {
+          // 连都没连上，继续点命令只会得到一串同因的失败，不如直接把结论摊开
+          for (const [name, ok, detail] of checks) console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+          console.log('[smoke] quick 终端都没起来，后面的断言跳过')
+          finish()
+          return
+        }
 
         /**
          * 读某个元素的提示文案。
@@ -2825,6 +3327,16 @@ function createWindow(): void {
           const items = [...p.querySelectorAll('.qp-chip')]
           const noDesc = items.filter((c) => !((c.querySelector('.qp-desc') || {}).textContent || '').trim())
           const r = p.getBoundingClientRect()
+          // ✎ 是「这条点了只插入不执行」的唯一视觉标记。命令一长，省略号会先把它吃掉 ——
+          // 元素还在 DOM 里，只是被父级 overflow 裁掉，所以只能比右边界和宽度。
+          const editClipped = items.filter((c) => {
+            const e = c.querySelector('.qp-edit')
+            if (!e) return false
+            const cr = c.getBoundingClientRect()
+            const er = e.getBoundingClientRect()
+            // 7px 是 10px 字的 ✎ 被压到看不清的分界；宽度不够等于白标
+            return er.right > cr.right + 0.5 || er.width < 7
+          }).length
           return {
             open: getComputedStyle(p).display !== 'none',
             groups: p.querySelectorAll('.qp-glabel').length,
@@ -2832,6 +3344,7 @@ function createWindow(): void {
             items: items.length,
             noDesc: noDesc.length,
             fills: p.querySelectorAll('.qp-chip.fill').length,
+            editClipped,
             top: Math.round(r.top),
             height: Math.round(r.height),
             viewH: window.innerHeight
@@ -2843,6 +3356,7 @@ function createWindow(): void {
           items: number
           noDesc: number
           fills: number
+          editClipped: number
           top: number
           height: number
           viewH: number
@@ -2852,6 +3366,7 @@ function createWindow(): void {
         push('命令总数', panel.items >= 28, `${panel.items} 条`)
         push('每条都有说明文字', panel.noDesc === 0, panel.noDesc ? `${panel.noDesc} 条缺说明` : '')
         push('带占位参数的命令', panel.fills >= 2, `${panel.fills} 条`)
+        push('fill 标记没被长命令挤掉', panel.editClipped === 0, panel.editClipped ? `${panel.editClipped} 张卡片的 ✎ 被裁掉了` : `${panel.fills} 张都完整`)
         // 浮层向上展开，顶边不能被顶出窗口
         push('浮层没有顶出窗格', panel.top >= 0 && panel.height > 100, `top=${panel.top} h=${panel.height} 窗高=${panel.viewH}`)
 
@@ -2861,33 +3376,58 @@ function createWindow(): void {
         push('fill 类提示了"只插入"', fillTip.includes('插入'), '')
 
         /**
+         * 命令表会一直长（磁盘管理、网络诊断这批加完是 69 条），浮层靠 .qp-body 滚动。
+         * 断言一下真能滚到底 —— 不然新加的分组排在最后，用户可能永远够不着。
+         * 查完立刻滚回顶部，后面的截图还要用首屏。
+         */
+        const scrollCheck = (await js(`(() => {
+          const b = document.querySelector('.quick-panel .qp-body')
+          if (!b) return { ok: false, needs: false }
+          const needs = b.scrollHeight > b.clientHeight + 4
+          b.scrollTop = b.scrollHeight
+          const atBottom = b.scrollTop + b.clientHeight >= b.scrollHeight - 4
+          const labels = [...b.querySelectorAll('.qp-glabel')].map((g) => g.textContent.trim())
+          b.scrollTop = 0
+          return { ok: needs && atBottom, needs, first: labels[0], last: labels[labels.length - 1] }
+        })()`)) as { ok: boolean; needs: boolean; first: string; last: string }
+        push(
+          '浮层能滚到最后一组',
+          scrollCheck.ok,
+          `${scrollCheck.first} → ${scrollCheck.last}${scrollCheck.needs ? '' : '（内容没超出，不需要滚动）'}`
+        )
+
+        /**
          * 行为验证：不截获 IPC，直接看终端里发生了什么。
          * contextBridge 暴露的对象是只读的，挂不了 spy，所以只能读屏幕：
          * - run 类点完应该真打出结果（df -h 的输出里有 Filesystem）
          * - fill 类点完应该只停在提示符上，最后一行是"提示符 + 命令"，没有输出
          * 先测 run 再测 fill，否则那条没回车的命令会被下一条命令拼在一起。
          */
-        const lastRows = async (n: number) =>
-          (await js(`(() => {
-            const rows = [...document.querySelectorAll('.xterm-rows > div')]
-              .map((d) => (d.textContent || '').replace(/\\u00a0/g, ' ').trimEnd())
-              .filter((r) => r.trim())
-            return rows.slice(-${n})
-          })()`)) as string[]
 
         await js(`(() => {
           const chip = [...document.querySelectorAll('.quick-chip')].find((c) => c.textContent.includes('df -h'))
           chip?.click()
         })()`)
-        await wait(1500)
-        const runTail = await lastRows(40)
+        /**
+         * 轮询等结果，别固定 sleep 一刀切。
+         * 写入是 ssh.write，从按键到远端回显要过网络 —— 连内网机器时 1.5 秒经常不够，
+         * 读到的就是空屏，报出来像"命令没执行"，其实是"还没回来"。
+         */
+        const waitForRows = async (want: (rows: string[]) => boolean, tries = 14, step = 400) => {
+          let rows: string[] = []
+          for (let i = 0; i < tries; i += 1) {
+            await wait(step)
+            rows = await lastRows(40)
+            if (want(rows)) break
+          }
+          return rows
+        }
+
         // 不能断言 "Filesystem"：中文 locale 的机器上 df 表头是「文件系统」。
         // 使用率那一列（34% /）不受语言影响，拿它当判据。
-        push(
-          '普通命令真的执行了',
-          runTail.some((r) => /\d+%/.test(r) && r.includes('/')),
-          runTail.slice(-2).join(' | ') || '终端是空的'
-        )
+        const hitDf = (rows: string[]) => rows.some((r) => /\d+%/.test(r) && r.includes('/'))
+        const runTail = await waitForRows(hitDf)
+        push('普通命令真的执行了', hitDf(runTail), runTail.slice(-2).join(' | ') || '终端是空的')
 
         const closedAfterRun = (await js(`(() => {
           const p = document.querySelector('.quick-panel')
@@ -2895,12 +3435,15 @@ function createWindow(): void {
         })()`)) as boolean
         push('执行后面板收起', closedAfterRun, '')
 
-        // 重新打开浮层，点那条带占位端口的 lsof
+        // 重新打开浮层，点那条带占位端口的 lsof。
+        // 按文本找而不是取第 0 个 fill —— 分组里一加命令索引就漂了，断言会无缘无故变红。
         await js(`document.querySelector('.quick-label')?.click()`)
         await wait(400)
-        await js(`document.querySelectorAll('.qp-chip.fill')[0]?.click()`)
-        await wait(600)
-        const fillTail = await lastRows(4)
+        await js(`(() => {
+          const c = [...document.querySelectorAll('.qp-chip.fill')].find((x) => x.textContent.includes('lsof -i:'))
+          c?.click()
+        })()`)
+        const fillTail = await waitForRows((rows) => (rows.slice(-1)[0] ?? '').includes('lsof -i:8080'), 10, 300)
         const lastLine = fillTail.slice(-1)[0] ?? ''
         push('fill 类只插入不回车', lastLine.includes('lsof -i:8080'), lastLine.slice(-48))
 
@@ -2917,13 +3460,22 @@ function createWindow(): void {
         await shot('thshell-quick.png')
 
         // 再拍一张带气泡的：气泡的 max-width / 行距只在真实渲染下才看得出好不好读
-        // 第 9 张卡片是 `du -sh * | sort -h`，带 note，三行都齐
+        // 挑 `du -sh * | sort -h`，带 note，三行都齐。同样按文本找，不按下标
         await js(`(() => {
-          const el = document.querySelectorAll('.qp-chip')[9]
+          const el = [...document.querySelectorAll('.qp-chip')].find((c) => c.textContent.includes('du -sh *'))
           if (el) el.dispatchEvent(new MouseEvent('mouseenter'))
         })()`)
         await wait(800)
         await shot('thshell-quick-tip.png')
+
+        // 再拍一张滚到底的：磁盘管理、网络诊断这些新分组排在后面，
+        // 只断言"能滚到"看不出排版对不对 —— 长命令撑破网格、✎ 被省略号吃掉，都得看眼睛。
+        await js(`(() => {
+          const b = document.querySelector('.quick-panel .qp-body')
+          if (b) b.scrollTop = b.scrollHeight
+        })()`)
+        await wait(500)
+        await shot('thshell-quick-bottom.png')
 
         let failed = 0
         for (const [name, ok, detail] of checks) {
@@ -4120,11 +4672,14 @@ if (!gotLock) {
 
 app.on('window-all-closed', () => {
   ssh.disconnectAll()
+  // 本地 shell 是真正的子进程，不主动 kill 的话关窗后会留下 ConPTY 宿主残留
+  localShell.closeAll()
   if (process.platform !== 'darwin') app.quit()
 })
 
 app.on('before-quit', () => {
   ssh.disconnectAll()
+  localShell.closeAll()
 })
 
 function registerIpc(): void {
@@ -4181,6 +4736,16 @@ function registerIpc(): void {
   )
   register('ssh:sysinfo', (sessionId: string) =>
     collectSystemInfo((command) => ssh.exec(sessionId, command))
+  )
+
+  // ---------- 本地终端 ----------
+  register('shell:open', (cols: number, rows: number) => localShell.open(cols, rows))
+  register('shell:close', (sessionId: string) => localShell.close(sessionId))
+  ipcMain.on('shell:write', (_e, sessionId: string, data: string) =>
+    localShell.write(sessionId, data)
+  )
+  ipcMain.on('shell:resize', (_e, sessionId: string, cols: number, rows: number) =>
+    localShell.resize(sessionId, cols, rows)
   )
 
   // ---------- Docker ----------

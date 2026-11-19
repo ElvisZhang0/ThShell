@@ -37,6 +37,12 @@ export interface Tab {
   /** 主进程返回的 SSH 会话 id，连接完成前为空 */
   sessionId: string
   serverId: string
+  /**
+   * 这条页签是本机终端还是远程连接。
+   * 缺省（老代码/老配置）按 'ssh' 处理 —— 加这个字段时还没本地终端，
+   * 所有历史状态都没有它，用可选比给几十处补默认值稳妥。
+   */
+  kind?: 'ssh' | 'local'
   title: string
   subtitle: string
   status: SessionStatus
@@ -168,6 +174,7 @@ export const useAppStore = defineStore('app', {
         id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         sessionId: '',
         serverId: server.id,
+        kind: 'ssh',
         title: server.name,
         subtitle: `${server.username}@${server.host}:${server.port}`,
         status: 'connecting',
@@ -204,9 +211,82 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    /**
+     * 开一个本机终端页签。
+     *
+     * 不做"已存在就复用"：本地终端天然可以开多个（一个跑构建、一个看日志），
+     * 这跟"一台服务器只留一个页签"的语义不一样，所以每次都新建。
+     */
+    async openLocalShell() {
+      // 同名页签编号：本地终端 #2 / #3，否则两个都叫"本地终端"分不清
+      const seq = this.tabs.filter((t) => t.kind === 'local').length + 1
+      const tab: Tab = {
+        id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        sessionId: '',
+        serverId: '',
+        kind: 'local',
+        title: seq === 1 ? '本地终端' : `本地终端 ${seq}`,
+        subtitle: '正在启动本地 shell…',
+        status: 'connecting',
+        view: 'terminal',
+        epoch: 0
+      }
+      this.tabs.push(tab)
+      this.activeTabId = tab.id
+
+      try {
+        const info = await window.api.shell.open(120, 32)
+        const target = this.tabs.find((t) => t.id === tab.id)
+        if (!target) {
+          // 启动期间页签被关掉了，进程要顺手收掉，否则留一个孤儿 shell
+          void window.api.shell.close(info.sessionId)
+          return
+        }
+        target.sessionId = info.sessionId
+        target.status = 'connected'
+        target.subtitle = `${info.shell} · ${info.cwd}`
+        target.epoch += 1
+      } catch (err) {
+        const target = this.tabs.find((t) => t.id === tab.id)
+        if (target) {
+          target.status = 'error'
+          target.message = cleanError(err)
+        }
+      }
+    },
+
+    /** 本地 shell 自己退出（用户敲 exit / 崩溃）时把页签标成已断开 */
+    applyShellExit(payload: { sessionId: string; exitCode: number }) {
+      const tab = this.tabs.find((t) => t.sessionId === payload.sessionId)
+      if (!tab) return
+      tab.status = 'closed'
+      tab.message = `本地 shell 已退出（退出码 ${payload.exitCode}）`
+    },
+
     async reconnect(tabId: string) {
       const tab = this.tabs.find((t) => t.id === tabId)
       if (!tab) return
+
+      if (tab.kind === 'local') {
+        // 本地终端没有"连接配置"可重连，就是重新拉一个 shell：
+        // 换个 sessionId，epoch 自增让 TerminalView 重建 xterm（旧屏幕内容已经作废）
+        if (tab.sessionId) void window.api.shell.close(tab.sessionId)
+        tab.status = 'connecting'
+        tab.message = undefined
+        tab.sessionId = ''
+        try {
+          const info = await window.api.shell.open(120, 32)
+          tab.sessionId = info.sessionId
+          tab.subtitle = `${info.shell} · ${info.cwd}`
+          tab.status = 'connected'
+          tab.epoch += 1
+        } catch (err) {
+          tab.status = 'error'
+          tab.message = cleanError(err)
+        }
+        return
+      }
+
       const server = this.serverById(tab.serverId)
       if (!server) {
         tab.status = 'error'
@@ -235,8 +315,12 @@ export const useAppStore = defineStore('app', {
       if (idx < 0) return
       const tab = this.tabs[idx]
       if (tab.sessionId) {
-        void window.api.ssh.disconnect(tab.sessionId)
-        delete this.metrics[tab.sessionId]
+        if (tab.kind === 'local') {
+          void window.api.shell.close(tab.sessionId)
+        } else {
+          void window.api.ssh.disconnect(tab.sessionId)
+          delete this.metrics[tab.sessionId]
+        }
       }
       this.tabs.splice(idx, 1)
       if (this.activeTabId === tabId) {

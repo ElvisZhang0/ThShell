@@ -154,6 +154,14 @@ export interface SessionState {
   message?: string
 }
 
+/** 本地终端启动后回给渲染层的信息，用来填页签标题和副标题 */
+export interface LocalShellInfo {
+  sessionId: string
+  /** 实际拉起来的 shell：PowerShell 7 / Windows PowerShell / Command Prompt / bash / zsh */
+  shell: string
+  cwd: string
+}
+
 /** 一次服务器资源快照 */
 export interface MetricSnapshot {
   time: number
@@ -607,6 +615,21 @@ export interface ThShellApi {
     sysinfo: (sessionId: string) => Promise<SystemInfo | null>
     onData: (cb: (payload: { sessionId: string; data: string }) => void) => () => void
     onState: (cb: (payload: SessionState) => void) => () => void
+  }
+  /**
+   * 本地终端（本机 shell，走 PTY）。
+   * 和 ssh 分开而不是塞进 ssh 命名空间：两者生命周期、错误语义都不一样，
+   * 混在一起以后排查"这个 sessionId 到底是远程还是本地"会很烦。
+   */
+  shell: {
+    open: (cols?: number, rows?: number) => Promise<LocalShellInfo>
+    close: (sessionId: string) => Promise<boolean>
+    write: (sessionId: string, data: string) => void
+    resize: (sessionId: string, cols: number, rows: number) => void
+    onData: (cb: (payload: { sessionId: string; data: string }) => void) => () => void
+    onExit: (
+      cb: (payload: { sessionId: string; exitCode: number; signal?: number }) => void
+    ) => () => void
   }
   sftp: {
     list: (sessionId: string, remotePath: string) => Promise<FileEntry[]>

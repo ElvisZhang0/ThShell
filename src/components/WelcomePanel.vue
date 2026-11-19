@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Plus, Connection, FolderOpened, Odometer } from '@element-plus/icons-vue'
+import { Plus, Connection, FolderOpened, Monitor, Odometer } from '@element-plus/icons-vue'
 import { useAppStore } from '../stores/app'
 import LogoMark from './LogoMark.vue'
 
-const emit = defineEmits<{ (e: 'new-server'): void }>()
+const emit = defineEmits<{ (e: 'new-server'): void; (e: 'new-local'): void }>()
 const store = useAppStore()
 
 const recent = computed(() =>
@@ -56,9 +56,14 @@ const features = [
         </div>
       </div>
 
-      <el-button type="primary" size="large" :icon="Plus" class="cta" @click="emit('new-server')">
-        新建连接
-      </el-button>
+      <div class="cta-row">
+        <el-button size="large" :icon="Monitor" @click="emit('new-local')">
+          本地终端
+        </el-button>
+        <el-button type="primary" size="large" :icon="Plus" class="cta" @click="emit('new-server')">
+          新建连接
+        </el-button>
+      </div>
 
       <div class="tips">
         <span><kbd>双击</kbd> 侧栏服务器建立连接</span>
@@ -204,6 +209,13 @@ h1 {
   font-size: 10px;
   color: var(--text-3);
   max-width: 96px;
+}
+
+/* 两个入口并排：本地终端不需要任何配置就能点，放在主按钮左边当次选 */
+.cta-row {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
 }
 
 .cta {

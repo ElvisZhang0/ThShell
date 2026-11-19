@@ -35,20 +35,36 @@ function toggleSidebar(): void {
   localStorage.setItem(SIDEBAR_KEY, sidebarOpen.value ? '1' : '0')
 }
 
-/** Ctrl+B 切侧边栏，和 VS Code 一致；输入框里不抢（编辑器里 Ctrl+B 另有含义） */
+/**
+ * Ctrl+B 切侧边栏，和 VS Code 一致；输入框里不抢（编辑器里 Ctrl+B 另有含义）。
+ * Ctrl+` 开一个本地终端 —— 终端软件的通用习惯，所以**在终端里按也要生效**：
+ * xterm 的输入是个隐藏 textarea，光看 tagName 会被误判成"正在打字"。
+ */
 function onKeydown(e: KeyboardEvent): void {
   if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return
-  if (e.key.toLowerCase() !== 'b') return
-  const el = e.target as HTMLElement | null
+  // 事件直接 dispatch 到 window 时 target 是 window，没有 classList ——
+  // 不能用 as HTMLElement 硬转，否则这里抛错会把整个处理函数打断（快捷键看着像没生效）
+  const el = e.target instanceof HTMLElement ? e.target : null
   const tag = el?.tagName
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return
-  e.preventDefault()
-  toggleSidebar()
+  const inTerminal = !!el?.classList?.contains('xterm-helper-textarea')
+  const typing = !inTerminal && (tag === 'INPUT' || tag === 'TEXTAREA' || !!el?.isContentEditable)
+  if (typing) return
+
+  if (e.key.toLowerCase() === 'b') {
+    e.preventDefault()
+    toggleSidebar()
+    return
+  }
+  if (e.key === '`') {
+    e.preventDefault()
+    void store.openLocalShell()
+  }
 }
 
 let offState: (() => void) | undefined
 let offProgress: (() => void) | undefined
 let offTransfer: (() => void) | undefined
+let offShellExit: (() => void) | undefined
 
 // 主题是全局的：改 settings.theme 后写到 <html data-theme>，
 // CSS 变量整体切换，终端那边另有 watch 同步 xterm 配色
@@ -68,11 +84,14 @@ function openSettings() {
 
 onMounted(async () => {
   await store.init()
-  window.addEventListener('keydown', onKeydown)
+  // 捕获阶段：xterm 在它自己的 textarea 上监听 keydown，冒泡阶段抢不到 Ctrl+`
+  window.addEventListener('keydown', onKeydown, true)
   offState = window.api.ssh.onState((payload) => store.applySessionState(payload))
   offProgress = window.api.sftp.onProgress((payload) => store.pushTransfer(payload))
   // 记录由主进程写（路径只有它拿得到原件），写完通知一声，界面重新拉列表
   offTransfer = window.api.transfer.onChanged(() => void store.loadTransferLog())
+  // 本地 shell 是被我们 spawn 出来的子进程，它自己退（敲 exit / 崩了）只有主进程知道
+  offShellExit = window.api.shell.onExit((payload) => store.applyShellExit(payload))
 
   // 启动后静默查一次更新：默认就走内置的 GitHub 源，不需要用户配任何东西。
   // **不弹窗** —— 有新版只在「关于」按钮上点个圆点，装不装、什么时候装由用户决定。
@@ -88,10 +107,11 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('keydown', onKeydown, true)
   offState?.()
   offProgress?.()
   offTransfer?.()
+  offShellExit?.()
   if (store.metricsTimer) clearInterval(store.metricsTimer)
 })
 </script>
@@ -101,6 +121,7 @@ onUnmounted(() => {
     <TitleBar
       :collapsed="!sidebarOpen"
       @new-server="openNewServer"
+      @new-local="store.openLocalShell()"
       @open-settings="openSettings"
       @toggle-sidebar="toggleSidebar"
       @open-about="aboutVisible = true"
@@ -119,7 +140,11 @@ onUnmounted(() => {
         <TabBar v-if="store.tabs.length" />
 
         <div class="workspace-body">
-          <WelcomePanel v-if="!store.tabs.length" @new-server="openNewServer" />
+          <WelcomePanel
+            v-if="!store.tabs.length"
+            @new-server="openNewServer"
+            @new-local="store.openLocalShell()"
+          />
 
           <template v-else>
             <SessionPane

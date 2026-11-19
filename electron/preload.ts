@@ -45,6 +45,16 @@ const api: ThShellApi = {
     onData: (cb) => subscribe<{ sessionId: string; data: string }>('ssh:data', cb),
     onState: (cb) => subscribe<SessionState>('ssh:state', cb)
   },
+  shell: {
+    open: (cols = 120, rows = 30) => ipcRenderer.invoke('shell:open', cols, rows),
+    close: (sessionId: string) => ipcRenderer.invoke('shell:close', sessionId),
+    write: (sessionId: string, data: string) => ipcRenderer.send('shell:write', sessionId, data),
+    resize: (sessionId: string, cols: number, rows: number) =>
+      ipcRenderer.send('shell:resize', sessionId, cols, rows),
+    onData: (cb) => subscribe<{ sessionId: string; data: string }>('shell:data', cb),
+    onExit: (cb) =>
+      subscribe<{ sessionId: string; exitCode: number; signal?: number }>('shell:exit', cb)
+  },
   sftp: {
     list: (sessionId: string, remotePath: string): Promise<FileEntry[]> =>
       ipcRenderer.invoke('sftp:list', sessionId, remotePath),

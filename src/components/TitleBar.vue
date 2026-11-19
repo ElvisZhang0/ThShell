@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowDown, Expand, Fold, Plus, Setting, Upload } from '@element-plus/icons-vue'
+import { ArrowDown, Expand, Fold, Monitor, Plus, Setting, Upload } from '@element-plus/icons-vue'
 import { computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAppStore, cleanError } from '../stores/app'
@@ -10,6 +10,7 @@ const props = defineProps<{ collapsed: boolean }>()
 
 const emit = defineEmits<{
   (e: 'new-server'): void
+  (e: 'new-local'): void
   (e: 'open-settings'): void
   (e: 'toggle-sidebar'): void
   (e: 'open-about'): void
@@ -112,6 +113,16 @@ async function importConfig() {
     <div class="spacer" />
 
     <div class="actions">
+      <!-- 本地终端放在"新建连接"前面：它是"随手开个本机 shell"，和"配一台服务器"是两件事，
+           而且不占侧栏的任何配置，所以不加重色按钮抢主按钮的视觉焦点 -->
+      <el-button
+        size="small"
+        :icon="Monitor"
+        title="打开本机终端（Ctrl+`）"
+        @click="emit('new-local')"
+      >
+        终端
+      </el-button>
       <el-button type="primary" size="small" :icon="Plus" @click="emit('new-server')">
         新建连接
       </el-button>

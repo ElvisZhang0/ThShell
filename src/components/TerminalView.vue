@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -13,6 +13,26 @@ import { HOT_COMMANDS, QUICK_GROUPS, QUICK_TOTAL, type QuickCommand } from '../u
 const props = defineProps<{ tab: Tab }>()
 const store = useAppStore()
 
+/**
+ * 本地终端和远程终端在这个组件里共用一套 xterm，
+ * 差别只有两处：字节往哪个通道写、快捷命令栏要不要显示。
+ * 分成两个组件的话，搜索/复制/右键菜单/主题那一大坨要复制一遍，没必要。
+ */
+const isLocal = computed(() => props.tab.kind === 'local')
+
+/** 往当前会话写字节。本地走 shell，远程走 ssh —— 其余逻辑完全一致 */
+function sendData(data: string): void {
+  if (!props.tab.sessionId) return
+  if (isLocal.value) window.api.shell.write(props.tab.sessionId, data)
+  else window.api.ssh.write(props.tab.sessionId, data)
+}
+
+function sendResize(cols: number, rows: number): void {
+  if (!props.tab.sessionId) return
+  if (isLocal.value) window.api.shell.resize(props.tab.sessionId, cols, rows)
+  else window.api.ssh.resize(props.tab.sessionId, cols, rows)
+}
+
 const termHost = ref<HTMLDivElement>()
 const searchOpen = ref(false)
 const searchText = ref('')
@@ -23,6 +43,8 @@ let term: Terminal | null = null
 let fitAddon: FitAddon | null = null
 let searchAddon: SearchAddon | null = null
 let offData: (() => void) | null = null
+let offLocalData: (() => void) | null = null
+let offLocalExit: (() => void) | null = null
 let resizeObserver: ResizeObserver | null = null
 let rafId = 0
 
@@ -105,7 +127,7 @@ async function pasteClipboard() {
   if (!term) return
   try {
     const text = await window.api.clipboard.read()
-    if (text) window.api.ssh.write(props.tab.sessionId, text)
+    if (text) sendData(text)
   } catch {
     ElMessage.error('读取剪贴板失败')
   }
@@ -115,7 +137,7 @@ function runQuick(item: QuickCommand) {
   term?.focus()
   // 带占位参数的命令只写进提示符、不回车：直接跑一条写死端口号的 lsof，
   // 输出是空的，看着像"这条命令没用"，其实是要先改参数。
-  window.api.ssh.write(props.tab.sessionId, item.mode === 'fill' ? item.cmd : item.cmd + '\r')
+  sendData(item.mode === 'fill' ? item.cmd : item.cmd + '\r')
   // 执行后收起面板，否则挡住刚打出来的结果
   panelOpen.value = false
 }
@@ -209,11 +231,27 @@ function initTerminal() {
   )
 
   term.open(termHost.value)
+
+  /**
+   * ⚠️ onResize / onData 必须在第一次 fit **之前**挂上。
+   *
+   * fit() 会把 xterm 从默认的 80x24 改成容器的实际行列，那一下必须同步给对端。
+   * 之前这里是先 doFit() 再 onResize，首次 fit 的事件没人接 —— SSH 那边因为连上后
+   * 会重挂一次组件侥幸没露，本地终端则是 PTY 永远停在主进程给的 120x30，
+   * 而 xterm 已经是 34 行 142 列。
+   *
+   * 后果不是"少了一行"，是 PowerShell 的 PSReadLine 重绘命令行时用**绝对光标定位**
+   * （ESC[<行>;<列>H，行号按它自己那份窗口高度算）。两边行数一对不上，敲下第一个
+   * 字母时光标就跑到提示符上面两三行去了 —— 看着像"光标飞了"，其实是尺寸没对齐。
+   */
+  term.onData((data) => sendData(data))
+  term.onResize(({ cols, rows }) => sendResize(cols, rows))
+
   doFit()
   term.focus()
-
-  term.onData((data) => window.api.ssh.write(props.tab.sessionId, data))
-  term.onResize(({ cols, rows }) => window.api.ssh.resize(props.tab.sessionId, cols, rows))
+  // 双保险：容器恰好等于 80x24 时 fit 不产生尺寸变化、不触发 onResize，
+  // 这时候主动同步一次，保证 PTY 从第一帧起就和界面一致
+  sendResize(term.cols, term.rows)
 
   // Ctrl+F 搜索 / Ctrl+Shift+C 复制 / Ctrl+Shift+V 粘贴
   term.attachCustomKeyEventHandler((event) => {
@@ -237,6 +275,15 @@ function initTerminal() {
   offData = window.api.ssh.onData(({ sessionId, data }) => {
     if (sessionId === props.tab.sessionId) term?.write(data)
   })
+  // 本地终端：数据 + 退出都要听。退出时在屏幕上留一行字，
+  // 否则用户敲完 exit 只看到提示符没了，不知道是崩了还是正常退的
+  offLocalData = window.api.shell.onData(({ sessionId, data }) => {
+    if (sessionId === props.tab.sessionId) term?.write(data)
+  })
+  offLocalExit = window.api.shell.onExit(({ sessionId, exitCode }) => {
+    if (sessionId !== props.tab.sessionId) return
+    term?.write(`\r\n\x1b[33m[本地 shell 已退出，退出码 ${exitCode}]\x1b[0m\r\n`)
+  })
 
   resizeObserver = new ResizeObserver(() => {
     cancelAnimationFrame(rafId)
@@ -258,6 +305,8 @@ onBeforeUnmount(() => {
   cancelAnimationFrame(rafId)
   resizeObserver?.disconnect()
   offData?.()
+  offLocalData?.()
+  offLocalExit?.()
   term?.dispose()
   term = null
 })
@@ -321,9 +370,19 @@ watch(
       </div>
     </transition>
 
-    <div ref="termHost" class="term-host" @contextmenu="openCtx" @mousedown="panelOpen = false" />
+    <!-- data-session-id 是给自动化冒烟用的：合成键盘事件要窗口有焦点，
+         无人值守跑的时候经常丢字，冒烟就靠这个属性直接调 IPC 往 PTY 写 -->
+    <div
+      ref="termHost"
+      class="term-host"
+      :data-session-id="props.tab.sessionId"
+      @contextmenu="openCtx"
+      @mousedown="panelOpen = false"
+    />
 
-    <div class="quick-bar">
+    <!-- 快捷命令是给 Linux 运维用的（df/ss/journalctl），本机 Windows shell 上按下去全是
+         "不是内部或外部命令"。本地终端直接不显示这一栏，把高度让给终端本身。 -->
+    <div v-if="!isLocal" class="quick-bar">
       <button class="quick-label" :class="{ on: panelOpen }" @click="togglePanel">
         <el-icon :class="{ flip: panelOpen }"><ArrowUp /></el-icon>
         快捷命令
@@ -352,7 +411,7 @@ watch(
     <!-- 全部命令浮层：挂在 .terminal-wrap 上而不是快捷栏里，
          这样 max-height 能按整个终端高度算，终端被拖矮时不会顶出窗格。
          做成浮层而不是横向再排一长条，是因为三十几条命令在一条会横滚的栏里根本找不到。 -->
-    <div v-show="panelOpen" class="quick-panel">
+    <div v-show="panelOpen && !isLocal" class="quick-panel">
       <div class="qp-head">
         <span class="qp-title">运维常用命令</span>
         <span class="qp-hint">共 {{ QUICK_TOTAL }} 条 · 点一下执行，悬停看说明</span>
@@ -376,8 +435,10 @@ watch(
                 <div v-for="line in tipLines(item)" :key="line" class="q-tip-n">{{ line }}</div>
               </template>
               <button class="qp-chip" :class="{ fill: item.mode === 'fill' }" @click="runQuick(item)">
+                <!-- 命令文本单独一层负责截断。✎ 是一整条超长命令（curl、tcpdump）上唯一能看出
+                     「点它只插入、不执行」的线索，不能跟着省略号一起被裁掉。 -->
                 <span class="qp-cmd mono">
-                  {{ item.cmd }}
+                  <span class="qp-cmd-t">{{ item.cmd }}</span>
                   <span v-if="item.mode === 'fill'" class="qp-edit">✎</span>
                 </span>
                 <span class="qp-desc">{{ item.desc }}</span>
@@ -670,10 +731,20 @@ watch(
 }
 
 .qp-cmd {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
   max-width: 100%;
-  overflow: hidden;
+  /* 少了这个，flex 项的默认 min-width:auto 会被最长的那条命令撑开，卡片宽度跟着涨、网格错位 */
+  min-width: 0;
   font-size: 11.5px;
   color: var(--text-1);
+}
+
+/* 真正被省略号截断的只有命令文本这一段 */
+.qp-cmd-t {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -683,9 +754,11 @@ watch(
 }
 
 .qp-edit {
-  margin-left: 3px;
+  flex: none;
   font-size: 10px;
-  color: var(--accent-line);
+  /* 原来用的是 --accent-line（分隔线那一档），10px 下淡到几乎看不见 ——
+     ✎ 是这条命令会插入而不执行的唯一标记，看不清就等于没有。用次要文字色。 */
+  color: var(--text-3);
 }
 
 .qp-desc {

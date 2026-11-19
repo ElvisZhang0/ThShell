@@ -5,17 +5,32 @@ import { useAppStore } from '../stores/app'
 const store = useAppStore()
 
 const active = computed(() => store.activeTab)
-const connectedCount = computed(
-  () => store.tabs.filter((t) => t.status === 'connected').length
+
+/**
+ * 远程连接和本地终端分开数。
+ * 混成"3 个活动连接"会让人以为开了三条 SSH —— 本地终端的"连接"其实是本机子进程，
+ * 两者排查方向完全不同（一个是网络/认证，一个是本机 shell 起没起来）。
+ */
+const remoteCount = computed(
+  () => store.tabs.filter((t) => t.status === 'connected' && t.kind !== 'local').length
 )
+const localCount = computed(
+  () => store.tabs.filter((t) => t.status === 'connected' && t.kind === 'local').length
+)
+const summary = computed(() => {
+  const parts: string[] = []
+  if (remoteCount.value) parts.push(`${remoteCount.value} 个远程连接`)
+  if (localCount.value) parts.push(`${localCount.value} 个本地终端`)
+  return parts.join(' · ') || '0 个活动连接'
+})
 const activeTransfer = computed(() => store.transfers.filter((t) => !t.done).length)
 </script>
 
 <template>
   <footer class="statusbar">
     <div class="left">
-      <span class="chip" :class="{ on: connectedCount > 0 }">
-        <span class="dot" />{{ connectedCount }} 个活动连接
+      <span class="chip" :class="{ on: remoteCount + localCount > 0 }">
+        <span class="dot" />{{ summary }}
       </span>
       <span v-if="active" class="chip mono">{{ active.subtitle }}</span>
       <span v-if="activeTransfer" class="chip transfer">↑↓ {{ activeTransfer }} 个传输中</span>

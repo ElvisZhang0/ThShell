@@ -9,14 +9,19 @@
  *    静默 `app.quit()` —— 零输出、退出码 0、日志 2 字节，看着像代码编译坏了。
  *    这里每个进程自己等它 exit 再跑下一个，并显式识别"无任何 [smoke] 输出"这种情形。
  *
- * 用法：
- *   npm run verify              # 默认跑 core：text log edit tips icons
- *   npm run verify -- log tips  # 只跑这两组
- *   npm run verify -- --layout  # 布局/视觉那批（foot menu jump transfer clip tabs quick monitor sys）
- *   npm run verify -- --all     # 全跑
- *   npm run verify -- -b        # 先 build 再跑
- *   npm run verify -- -v        # 逐条打印断言（默认只吐失败行）
- *   npm run verify -- --list    # 看看有哪些组
+ * 用法（**默认不跑全量**，必须指名本次改动对应的组）：
+ *   npm run verify -- local           # 只跑本次动到的那一组
+ *   npm run verify -- local bar       # 动了几处就跑几组
+ *   npm run verify -- --core          # 全部核心组（发版前才用，慢）
+ *   npm run verify -- --layout        # 布局/视觉那批（foot menu jump transfer clip tabs quick monitor sys）
+ *   npm run verify -- --all           # 全跑
+ *   npm run verify -- -b              # 先 build 再跑
+ *   npm run verify -- -v              # 逐条打印断言（默认只吐失败行）
+ *   npm run verify -- --list          # 看看有哪些组
+ *
+ * 为什么去掉"裸跑就全量"：一组 ~10s，全量十来组就两三分钟。
+ * 改一处 CSS 把 22 个组全跑一遍，除了让输出变长、把真正的失败埋掉，没有收益。
+ * 只跑本次改动对应的组，失败才是信号。
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
@@ -29,7 +34,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const electronPath = require('electron')
 
 /** 改完代码必须过一遍的几组：都自带数据准备，不依赖机器上有什么文件 */
-const CORE = ['bar', 'update', 'text', 'log', 'pdf', 'edit', 'tips', 'icons', 'perm']
+const CORE = ['bar', 'update', 'text', 'log', 'pdf', 'edit', 'tips', 'icons', 'perm', 'local']
 /** 布局 / 视觉类：只在动了对应区域时带上，跑得慢（每组 ~10s） */
 const LAYOUT = ['foot', 'menu', 'jump', 'transfer', 'clip', 'tabs', 'quick', 'monitor', 'sys']
 const ALL = [...CORE, ...LAYOUT]
@@ -42,14 +47,25 @@ const named = argv
   .split(',')
   .filter(Boolean)
 
-let groups = named.length ? named : CORE
+let groups = named
 if (flags.includes('--all')) groups = ALL
+else if (flags.includes('--core')) groups = CORE
 else if (flags.includes('--layout')) groups = named.length ? named : LAYOUT
 
 if (flags.includes('--list')) {
   console.log('core  :', CORE.join(' '))
   console.log('layout:', LAYOUT.join(' '))
   process.exit(0)
+}
+
+// 裸跑不再默认全量：只跑本次改动对应的组，这是纪律不是省事
+if (!groups.length) {
+  console.error('✗ 没指定要跑哪组。只跑本次改动涉及的那一组就行，不要全量回归。')
+  console.error('  例：pnpm verify -- local       （改了本地终端）')
+  console.error('      pnpm verify -- quick bar   （改了两处就写两组）')
+  console.error('  发版前确需全量：pnpm verify -- --all')
+  console.error('  看有哪些组  ：pnpm verify -- --list')
+  process.exit(1)
 }
 
 const TIMEOUT_MS = 150_000
