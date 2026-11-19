@@ -28,9 +28,11 @@ jobs:
             os: windows-latest
             args: --win --x64
             artifact: ThShell-windows
-          # macos-latest 是 arm64 机器，两个架构都能从它交叉打出来
+          # macos-latest（Sequoia）上 `hdiutil create -fs APFS` 会偶发 Exit code 1，
+          # electron-builder 只报 "unable to execute hdiutil"，重试 5 次照样失败。
+          # 钉死 macos-14（Sonoma）绕开；这台也是 arm64，x64 由它交叉打出来。
           - name: macOS (x64 + arm64)
-            os: macos-latest
+            os: macos-14
             args: --mac --x64 --arm64
             artifact: ThShell-macos
           # 在 Linux 上原生构建，不用 Docker —— 这也是唯一能产出 deb/rpm 的环境。
