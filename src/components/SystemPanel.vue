@@ -3,12 +3,14 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { CaretRight, Coin, Cpu, Link, Monitor, Odometer, Refresh, User } from '@element-plus/icons-vue'
 import type { Tab } from '../stores/app'
 import { cleanError } from '../stores/app'
+import { usePaneBusy } from '../utils/pane-busy'
 import type { LoginSession, SystemInfo } from '../../electron/types'
 
 const props = defineProps<{ tab: Tab }>()
 
 const info = ref<SystemInfo | null>(null)
 const loading = ref(false)
+usePaneBusy('system', loading)
 const error = ref('')
 /** 采不到东西（Windows 主机、极简容器没有 /proc）时给一句人话，而不是空白页 */
 const unsupported = ref(false)

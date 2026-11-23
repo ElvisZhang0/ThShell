@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import {
   Box,
   Cpu,
   FolderOpened,
+  Loading,
   Monitor,
   Odometer,
   RefreshRight,
@@ -11,6 +12,7 @@ import {
 } from '@element-plus/icons-vue'
 import { useAppStore } from '../stores/app'
 import type { Tab, ViewKind } from '../stores/app'
+import { providePaneBusy } from '../utils/pane-busy'
 import TerminalView from './TerminalView.vue'
 import FileManager from './FileManager.vue'
 import MonitorPanel from './MonitorPanel.vue'
@@ -69,6 +71,20 @@ const live = computed(() =>
     ? !!props.tab.sessionId
     : props.tab.status === 'connected' && !!props.tab.sessionId
 )
+
+/**
+ * 各面板自己上报「正在取数据」，这里有份汇总用来换页签图标。
+ * 页签是常驻的，内容区却是空的 —— 不转个圈，用户分不清是没加载完还是真没有。
+ */
+const busy = reactive<Partial<Record<ViewKind, boolean>>>({})
+providePaneBusy((kind, flag) => {
+  busy[kind] = flag
+})
+
+function spinning(kind: ViewKind): boolean {
+  // 建连阶段面板还没挂载，图标转起来至少能看出「在等服务器」
+  return props.tab.status === 'connecting' || !!busy[kind]
+}
 </script>
 
 <template>
@@ -84,7 +100,8 @@ const live = computed(() =>
           :disabled="!live"
           @click="tab.view = view.key"
         >
-          <el-icon><component :is="view.icon" /></el-icon>
+          <el-icon v-if="spinning(view.key)" class="spin"><Loading /></el-icon>
+          <el-icon v-else><component :is="view.icon" /></el-icon>
           {{ view.label }}
         </button>
         <button
@@ -94,7 +111,8 @@ const live = computed(() =>
           :disabled="!live"
           @click="tab.view = 'docker'"
         >
-          <el-icon><Box /></el-icon>
+          <el-icon v-if="spinning('docker')" class="spin"><Loading /></el-icon>
+          <el-icon v-else><Box /></el-icon>
           容器
         </button>
       </div>
@@ -219,6 +237,11 @@ const live = computed(() =>
 /* 图标跟着一起放大，否则 12px 的文字配 12px 的图标显得又小又糊 */
 .seg-btn .el-icon {
   font-size: var(--icon-sm);
+}
+
+/* 取数据时的转圈：占位宽度不变，所以后面几个页签不会左右跳 */
+.seg-btn .el-icon.spin {
+  animation: spin 0.9s linear infinite;
 }
 
 .seg-btn:hover:not(:disabled) {

@@ -2,25 +2,21 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Box,
-  CircleCheck,
   Coin,
-  Delete,
-  Document,
   Files,
-  Film,
   FolderOpened,
   Grid,
   InfoFilled,
   Loading,
   Refresh,
-  RefreshRight,
   Search,
-  SwitchButton,
   VideoPause
 } from '@element-plus/icons-vue'
+import OpIcon from './OpIcon.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Tab } from '../stores/app'
 import { cleanError } from '../stores/app'
+import { usePaneBusy } from '../utils/pane-busy'
 import type {
   DockerComposeProject,
   DockerContainer,
@@ -45,6 +41,7 @@ const subTabs: { key: TabKey; label: string; icon: typeof Box }[] = [
 
 const sub = ref<TabKey>('containers')
 const loading = ref(false)
+usePaneBusy('docker', loading)
 const busy = ref('')
 const error = ref('')
 const loadedAt = ref(0)
@@ -633,49 +630,60 @@ function reload() {
           <span class="c-ports mono truncate" :title="c.ports">{{ shortPorts(c.ports) }}</span>
           <span class="c-age">{{ c.runningFor || c.created }}</span>
           <span class="c-act">
-            <el-tooltip v-if="c.state !== 'running'" content="启动" :show-after="400">
-              <button class="op" data-op="start" :disabled="busy === c.id" @click="act(c, 'start')">
-                <el-icon><CircleCheck /></el-icon>
+            <!-- 运行控制：▶ / ■ 这一对是 Docker 世界的通用语汇 -->
+            <el-tooltip
+              v-if="c.state !== 'running' && c.state !== 'paused'"
+              content="启动"
+              :show-after="400"
+            >
+              <button class="op go" data-op="start" :disabled="busy === c.id" @click="act(c, 'start')">
+                <OpIcon name="start" />
               </button>
             </el-tooltip>
             <el-tooltip v-if="c.state === 'running'" content="停止" :show-after="400">
-              <button class="op" data-op="stop" :disabled="busy === c.id" @click="act(c, 'stop')">
-                <el-icon><SwitchButton /></el-icon>
+              <button class="op go" data-op="stop" :disabled="busy === c.id" @click="act(c, 'stop')">
+                <OpIcon name="stop" />
+              </button>
+            </el-tooltip>
+            <el-tooltip v-if="c.state === 'paused'" content="恢复运行" :show-after="400">
+              <button class="op go" data-op="unpause" :disabled="busy === c.id" @click="act(c, 'unpause')">
+                <OpIcon name="resume" />
               </button>
             </el-tooltip>
             <el-tooltip v-if="c.state === 'running'" content="重启" :show-after="400">
               <button class="op" data-op="restart" :disabled="busy === c.id" @click="act(c, 'restart')">
-                <el-icon><RefreshRight /></el-icon>
+                <OpIcon name="restart" />
               </button>
             </el-tooltip>
             <el-tooltip v-if="c.state === 'running'" content="暂停" :show-after="400">
               <button class="op" data-op="pause" :disabled="busy === c.id" @click="act(c, 'pause')">
-                <el-icon><VideoPause /></el-icon>
+                <OpIcon name="pause" />
               </button>
             </el-tooltip>
-            <el-tooltip v-if="c.state === 'paused'" content="恢复" :show-after="400">
-              <button class="op" data-op="unpause" :disabled="busy === c.id" @click="act(c, 'unpause')">
-                <el-icon><CircleCheck /></el-icon>
-              </button>
-            </el-tooltip>
+
+            <!-- 只读：进去看，不改状态 -->
+            <i class="op-sep" />
             <el-tooltip v-if="c.state === 'running'" content="进入容器终端" :show-after="400">
               <button class="op" data-op="shell" @click="openShell(c)">
-                <el-icon><Film /></el-icon>
+                <OpIcon name="terminal" />
               </button>
             </el-tooltip>
             <el-tooltip content="日志" :show-after="400">
               <button class="op" data-op="logs" @click="openLogs(c)">
-                <el-icon><Document /></el-icon>
+                <OpIcon name="logs" />
               </button>
             </el-tooltip>
             <el-tooltip content="详情" :show-after="400">
               <button class="op" data-op="detail" @click="openDetail(c)">
-                <el-icon><InfoFilled /></el-icon>
+                <OpIcon name="detail" />
               </button>
             </el-tooltip>
+
+            <!-- 不可逆 -->
+            <i class="op-sep" />
             <el-tooltip content="删除" :show-after="400">
               <button class="op del" data-op="remove" :disabled="busy === c.id" @click="act(c, 'remove')">
-                <el-icon><Delete /></el-icon>
+                <OpIcon name="remove" />
               </button>
             </el-tooltip>
           </span>
@@ -704,7 +712,7 @@ function reload() {
           <span class="c-age">{{ img.created }}</span>
           <span class="c-act">
             <el-tooltip content="删除镜像" :show-after="400">
-              <button class="op del" @click="removeImage(img)"><el-icon><Delete /></el-icon></button>
+              <button class="op del" @click="removeImage(img)"><OpIcon name="remove" /></button>
             </el-tooltip>
           </span>
         </div>
@@ -731,7 +739,7 @@ function reload() {
           <span class="c-scope">{{ net.scope }}</span>
           <span class="c-act">
             <el-tooltip content="删除网络" :show-after="400">
-              <button class="op del" @click="removeNetwork(net)"><el-icon><Delete /></el-icon></button>
+              <button class="op del" @click="removeNetwork(net)"><OpIcon name="remove" /></button>
             </el-tooltip>
           </span>
         </div>
@@ -755,7 +763,7 @@ function reload() {
           <span class="c-scope">{{ vol.scope }}</span>
           <span class="c-act">
             <el-tooltip content="删除卷" :show-after="400">
-              <button class="op del" @click="removeVolume(vol)"><el-icon><Delete /></el-icon></button>
+              <button class="op del" @click="removeVolume(vol)"><OpIcon name="remove" /></button>
             </el-tooltip>
           </span>
         </div>
@@ -1065,7 +1073,8 @@ function reload() {
 .dk-body {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  /* 表格列已经按容器宽度分配好了，这里再把横轴锁死，免得差个几像素又冒出一条横条 */
+  overflow: hidden auto;
   padding: 0 0 8px;
 }
 
@@ -1080,7 +1089,19 @@ function reload() {
 /* 列宽模板写在容器上而不是行上：列表为空时表头也不会坍缩成竖排 */
 .dk-body.containers .thead,
 .dk-body.containers .row {
-  grid-template-columns: 230px 230px 170px 190px 92px minmax(180px, 1fr);
+  /*
+   * 只有操作列是固定宽（7 颗 26px 按钮 + 2 条分隔线 ≈ 200px，写死 208 留余量）；
+   * 其余五列用 fr 分剩余空间 —— 原来 230/230/170/190/92 加起来 1202px，
+   * 窗口一窄就顶穿容器，整个列表底部横出一条滚动条。
+   * 单元格里都做了 truncate + title，压窄只会变省略号，不会丢信息。
+   */
+  grid-template-columns:
+    minmax(0, 1.15fr) /* 名称 + 短 ID */
+    minmax(0, 1.05fr) /* 镜像 */
+    minmax(0, 0.62fr) /* 状态 */
+    minmax(0, 0.85fr) /* 端口 */
+    minmax(0, 0.62fr) /* 创建 */
+    216px; /* 操作：7 颗 26px 按钮 + 2 条分隔线，实测正好占满 */
 }
 
 .dk-body.images .thead,
@@ -1131,12 +1152,28 @@ function reload() {
 .nm {
   color: var(--text-1);
   font-weight: 500;
+  /* 名称列被压窄时要能跟着缩，否则内容会把整行顶出容器 */
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .sid {
   font-size: 10px;
   color: var(--text-3);
   flex: none;
+}
+
+/* 窄窗口下名称列只剩一百多像素，12 位短 ID 会把容器名挤成 "eva…"：
+   ID 详情页里也有，这里先让位给名字 */
+@media (max-width: 1280px) {
+  .sid {
+    display: none;
+  }
+
+  /* 状态列同理：pill「运行中」已经够了，"Up 4 weeks (healthy)" 详情里能看 */
+  .row .c-state .status-text {
+    display: none;
+  }
 }
 
 .row-ic {
@@ -1219,6 +1256,10 @@ function reload() {
 .row .c-age {
   color: var(--text-3);
   font-size: 11px;
+  /* 行高只有 36px，一折行就会顶出格子压住下一行 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .row .c-act {
@@ -1249,6 +1290,22 @@ function reload() {
 .op:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* 启停是整列里最常点的，比"看看"类图标亮一档，扫视时先落到它身上 */
+.op.go {
+  color: var(--text-1);
+}
+
+/* 变更 / 只读 / 危险 三组之间的分隔，避免一排按钮糊成一条 */
+.op-sep {
+  flex: none;
+  width: 1px;
+  height: 15px;
+  margin: 0 4px;
+  /* --border 在两套主题下都太淡，用 42% 的文字色才看得出这条线 */
+  background: color-mix(in srgb, var(--text-3) 42%, transparent);
+  align-self: center;
 }
 
 .op.del:hover {
@@ -1432,10 +1489,34 @@ function reload() {
 }
 
 .prune-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  display: grid;
+  /*
+   * 固定五等分，而不是 flex 自动排。
+   * 这排按钮原来正好把卡片宽度占满（五颗加起来 ≈ 524px / 可用 523px），
+   * 点「一键清理」后按钮里多出 loading 图标、宽出 20px，最后一个就被挤到下一行。
+   * 用 grid 后每格宽度写死，loading 转不转都不影响布局。
+   */
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
   margin-top: 12px;
+}
+
+.prune-row .el-button {
+  width: 100%;
+  padding-left: 4px;
+  padding-right: 4px;
+  white-space: nowrap;
+}
+
+/* Element Plus 会给相邻按钮加 margin-left:12px，在固定列宽的 grid 里会把整排顶出卡片 */
+.prune-row :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+/* 窄窗口下宁可省略号，也不让文字折行把按钮撑高 */
+.prune-row .el-button > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .compose-row {

@@ -13,7 +13,8 @@ import SettingsDialog from './components/SettingsDialog.vue'
 import AboutDialog from './components/AboutDialog.vue'
 import HelpDialog from './components/HelpDialog.vue'
 import UpdateDialog from './components/UpdateDialog.vue'
-import { runCheck } from './utils/update-state'
+import { runCheck, updateState } from './utils/update-state'
+import { ElNotification } from 'element-plus'
 
 const store = useAppStore()
 const serverDialogVisible = ref(false)
@@ -71,6 +72,31 @@ let offShellExit: (() => void) | undefined
 watch(
   () => store.config.settings.theme,
   () => store.applyTheme()
+)
+
+/**
+ * 后台下载下完的那一刻给一条通知。
+ *
+ * 用户已经把弹窗关了、很可能切到别的标签在干活 —— 光在状态栏变一行字太容易被忽略，
+ * 而"装不装"是他要做的决定，不能让它悄悄躺着。点通知直接回到检查更新。
+ *
+ * 只在后台模式通知：前台一键升级自己会拉起安装程序，不用再打扰一遍。
+ */
+watch(
+  () => [updateState.downloading, updateState.filePath] as const,
+  ([now, file], prev) => {
+    const [was, prevFile] = prev ?? [false, '']
+    if (!was || now || !file || prevFile || !updateState.background) return
+    ElNotification({
+      title: '更新包已下载',
+      message: `ThShell ${updateState.result?.latest ?? ''} 已就绪，点这里安装`,
+      type: 'success',
+      duration: 10_000,
+      onClick: () => {
+        updateVisible.value = true
+      }
+    })
+  }
 )
 
 function openNewServer() {
@@ -160,7 +186,7 @@ onUnmounted(() => {
 
     <!-- 传输面板贴在状态栏上方：状态栏是最底层的"系统信息"，不该被顶下去 -->
     <TransferDock />
-    <StatusBar />
+    <StatusBar @open-update="updateVisible = true" />
 
     <ServerDialog v-model="serverDialogVisible" :server-id="editingServerId" />
     <SettingsDialog v-model="settingsVisible" />

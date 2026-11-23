@@ -28,6 +28,14 @@ export const updateState = reactive({
   /** 最近一次检查结果；null = 还没查过 */
   result: null as UpdateCheckResult | null,
   downloading: false,
+  /**
+   * 这次下载是**后台**进行的：关掉弹窗也继续下，下完只提示、不自动安装。
+   *
+   * 前台一键升级（`runUpgrade`）在下载途中被用户关窗时会翻成 true —— 否则
+   * 应用会在用户没看着的时候自己退出并开始安装，这个行为太突然。
+   * 不在下载结束时清掉：`runUpgrade` 要在 await 之后靠它决定跳不跳过安装。
+   */
+  background: false,
   /** 安装包已下完，正在拉起安装程序 */
   installing: false,
   /**
@@ -46,6 +54,7 @@ export const updateState = reactive({
 
 export function resetDownload(): void {
   updateState.downloading = false
+  updateState.background = false
   updateState.installing = false
   updateState.launched = false
   updateState.progress = { transferred: 0, total: 0, percent: 0, speed: 0 }
@@ -53,9 +62,20 @@ export function resetDownload(): void {
   updateState.error = ''
 }
 
-/** 检查一次。返回结果方便调用方决定要不要弹窗（启动时的静默检查只看 available） */
-export async function runCheck(feed: string): Promise<UpdateCheckResult | null> {
+/**
+ * 检查一次。返回结果方便调用方决定要不要弹窗（启动时的静默检查只看 available）
+ *
+ * `force` 是「重新检查」按钮用的。默认**不重查**的情况只有两种：
+ *   - 正在后台下载：重查会把进度条和下载标记全清掉，用户会以为下载没了；
+ *   - 已经下好只等安装：重查会把 filePath 丢掉，等于逼用户再下一遍 100MB。
+ * 两种情况都沿用现有结果，界面显示的是真实的下载状态。
+ */
+export async function runCheck(
+  feed: string,
+  force = false
+): Promise<UpdateCheckResult | null> {
   if (updateState.checking) return updateState.result
+  if (!force && (updateState.downloading || updateState.filePath)) return updateState.result
   // 空串交给主进程：它会在「直连 + 国内镜像」里并发挑一条能通的
   const target = (feed || '').trim()
   updateState.checking = true
@@ -83,10 +103,11 @@ export async function runCheck(feed: string): Promise<UpdateCheckResult | null> 
  * 直接丢给 ipcRenderer.invoke 会在结构化克隆那一步抛
  * "An object could not be cloned"（本文件曾经就是这个报错的源头）。
  */
-export async function runDownload(): Promise<string | null> {
+export async function runDownload(background = false): Promise<string | null> {
   const asset = updateState.result?.asset as UpdateAsset | undefined
   if (!asset || updateState.downloading) return null
   updateState.downloading = true
+  updateState.background = background
   updateState.error = ''
   resetProgressOnly()
   const off = window.api.update.onProgress((p) => {
@@ -140,9 +161,36 @@ export async function runInstall(): Promise<void> {
  */
 export async function runUpgrade(): Promise<void> {
   // 上一次已经下好了（比如自动安装失败后重试），直接重装，别重下 99MB
-  const path = updateState.filePath || (await runDownload())
+  const path = updateState.filePath || (await runDownload(false))
   if (!path) return
+  // 下载途中用户点了「后台下载」或者直接把弹窗关了 —— 这时候不能自动装：
+  // 应用会在用户没看着的时候自己退出，比"装完自动重开"还吓人。
+  if (updateState.background) return
   await runInstall()
+}
+
+/**
+ * 后台下载：只把包拿下来，不碰安装。
+ *
+ * 和 `runUpgrade` 唯一的区别就在最后那一脚 —— 用户在等 100MB 的时候不想被弹窗
+ * 钉在屏幕前，关掉就该继续下，下完给个提示、由他自己挑时间装。
+ */
+export async function runBackgroundDownload(): Promise<boolean> {
+  if (updateState.filePath) return true
+  const path = await runDownload(true)
+  return !!path
+}
+
+/**
+ * 把正在进行的下载转入后台。
+ *
+ * 不取消、不重下 —— 只是把 `background` 翻成 true，让 `runUpgrade` 在 await
+ * 回来时跳过安装那一步。取消是另一件明确的事，走 `cancelDownload`。
+ */
+export function toBackground(): void {
+  if (!updateState.downloading) return
+  updateState.background = true
+  updateState.message = '已转入后台下载，关掉这个窗口也会继续'
 }
 
 export function cancelDownload(): void {

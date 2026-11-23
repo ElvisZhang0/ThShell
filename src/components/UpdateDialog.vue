@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { computed, watch } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAppStore } from '../stores/app'
 import { formatSize, formatSpeed } from '../utils/transfer-format'
 import {
   cancelDownload,
   feedLabel,
+  runBackgroundDownload,
   runCheck,
+  runInstall,
   runUpgrade,
+  toBackground,
   updateState
 } from '../utils/update-state'
 
@@ -50,7 +53,8 @@ watch(
 )
 
 async function retry(): Promise<void> {
-  await runCheck(feed.value)
+  // force：用户明确点了「重新检查」，这时候才允许丢掉已经下好的包
+  await runCheck(feed.value, true)
 }
 
 /**
@@ -74,6 +78,51 @@ async function upgrade(): Promise<void> {
     }
   }
   await runUpgrade()
+  // 下载途中被转后台（用户点了「后台下载」或关了窗）：runUpgrade 已经跳过安装，
+  // 这里补一句提示，免得用户以为点了升级却什么都没发生
+  if (updateState.background && updateState.filePath && !updateState.launched) {
+    ElMessage.success('更新包已下载完成，随时可以在这里安装')
+  }
+}
+
+/** 包已经躺在本地，只差安装 */
+const ready = computed(() => !!updateState.filePath && !updateState.launched)
+
+/**
+ * 后台下载：关掉弹窗，让下载在背后继续。
+ *
+ * 两种状态一起处理 —— 还没开始（直接开始下）和已经在下载（只是别再自动装）。
+ * 下完不自动 install：应用自己退出重启这件事，必须在用户看着的时候发生。
+ */
+function background(): void {
+  visible.value = false
+  if (updateState.downloading) {
+    toBackground()
+    ElMessage.info('已转入后台下载，进度显示在底部状态栏')
+    return
+  }
+  ElMessage.info(`正在后台下载 ThShell ${r.value?.latest ?? ''}，进度显示在底部状态栏`)
+  void runBackgroundDownload().then((ok) => {
+    if (!ok && updateState.error) ElMessage.error(updateState.error)
+  })
+}
+
+async function install(): Promise<void> {
+  await runInstall()
+}
+
+/**
+ * 关闭：下载还在跑就转后台。
+ *
+ * 不能让用户以为「关掉 = 取消」（取消有专门的按钮），更不能让它下完在背后自动装 ——
+ * 那是前台一键升级的行为，用户没看着的时候发生会很吓人。
+ */
+function close(): void {
+  visible.value = false
+  if (updateState.downloading) {
+    toBackground()
+    ElMessage.info('下载已转入后台，进度显示在底部状态栏')
+  }
 }
 
 /** 启动安装程序后被禁用：防止在应用退出前连点，起两个安装进程互抢文件 */
@@ -129,6 +178,9 @@ const busy = computed(
             </div>
           </div>
 
+          <div v-if="ready && !updateState.installing" class="row ok">
+            安装包已下载完成，随时可以安装
+          </div>
           <div v-if="updateState.message" class="row ok">{{ updateState.message }}</div>
           <div v-if="updateState.error" class="row warn">{{ updateState.error }}</div>
           <!-- 自动安装失败时的退路：包已经校验完躺在本地，重试不必再下一遍 -->
@@ -155,23 +207,40 @@ const busy = computed(
           重新检查
         </el-button>
 
-        <template v-if="r?.hasUpdate && r.asset && !r.unsupported">
-          <el-button v-if="updateState.downloading" size="small" @click="cancelDownload">
-            取消下载
-          </el-button>
+        <!-- checking 时也要藏起来：此时 r 还是上一次的结果，按钮却已经可点，
+             用户会拿着旧版本的包去升级 -->
+        <template v-if="r?.hasUpdate && r.asset && !r.unsupported && !updateState.checking">
+          <!-- 已经下好：主按钮直接装，不必再下一次 100MB -->
           <el-button
-            v-else
+            v-if="ready"
             type="primary"
             size="small"
             :loading="updateState.installing"
-            :disabled="busy"
-            @click="upgrade"
+            :disabled="updateState.launched"
+            @click="install"
           >
-            {{ updateState.launched ? '正在安装' : `升级到 ${r.latest}` }}
+            {{ updateState.launched ? '正在安装' : `安装 ${r.latest}` }}
           </el-button>
+
+          <template v-else>
+            <!-- 下载中和还没开始都能点：关掉弹窗，下载在背后继续 -->
+            <el-button size="small" @click="background">后台下载</el-button>
+            <el-button v-if="updateState.downloading" size="small" @click="cancelDownload">
+              取消下载
+            </el-button>
+            <el-button
+              v-else
+              type="primary"
+              size="small"
+              :disabled="busy"
+              @click="upgrade"
+            >
+              升级到 {{ r.latest }}
+            </el-button>
+          </template>
         </template>
 
-        <el-button size="small" @click="visible = false">关闭</el-button>
+        <el-button size="small" @click="close">关闭</el-button>
       </div>
     </template>
   </el-dialog>

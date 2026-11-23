@@ -453,6 +453,32 @@ function createWindow(): void {
 
         await clickSeg('容器')
         await wait(3000)
+
+        /**
+         * 容器表是最容易在窄窗口下露馅的地方：列宽一旦写死，合计超过容器宽度，
+         * 整个列表底部就会横出一条滚动条（鼠标滚轮还能把内容拖歪）。
+         * 这里缩到最小宽度量一遍，再恢复，别影响后面按宽窗口设计的断言。
+         */
+        const [origW, origH] = mainWindow!.getContentSize()
+        mainWindow!.setContentSize(1082, 647)
+        await wait(800)
+        const hOverflow = (await js(`(() => {
+          const out = []
+          document.querySelectorAll('.dk *').forEach((el) => {
+            if (el.scrollWidth <= el.clientWidth + 1) return
+            const ox = getComputedStyle(el).overflowX
+            if (ox !== 'auto' && ox !== 'scroll') return
+            out.push(\`\${el.tagName.toLowerCase()}.\${(el.className || '').toString().slice(0, 40)}\`)
+          })
+          return out
+        })()`)) as string[]
+        console.log(
+          `[smoke] ${hOverflow.length === 0 ? 'PASS' : 'FAIL'} 窄窗口容器表没有横向滚动条 ${JSON.stringify(hOverflow)}`
+        )
+        await shot('docker-narrow.png')
+        mainWindow!.setContentSize(origW, origH)
+        await wait(600)
+
         // 诊断：直接在主进程跑一遍 docker ps，和界面渲染对照，"行数 0"才能分清是没容器还是解析挂了
         try {
           const sid = (await js(`window.__store?.tabs.find((t) => t.sessionId)?.sessionId || ''`)) as string
@@ -470,6 +496,35 @@ function createWindow(): void {
           `[...document.querySelectorAll('.dk .row .pill')].map((e) => e.textContent.trim()).slice(0, 8)`
         )) as string[]
         console.log(`[smoke] ${rows > 0 ? 'PASS' : 'FAIL'} 容器行数=${rows} 状态=${states.join('/')}`)
+
+        /**
+         * 操作列图标：这一排曾经是 Element Plus 拼凑出来的 —— 启动用 CircleCheck（对勾）、
+         * 进终端用 Film（胶片），语义都不对，而且"启动"和"恢复"共用同一个图标。
+         * 现在统一成 OpIcon 的 9 个形状，并按"变更 / 只读 / 危险"分成三组。
+         * 这里钉住两件事：整排都得是同一套 SVG（不许混回 el-icon），分组线有 2 条。
+         */
+        const ops = (await js(`(() => {
+          const row = document.querySelector('.dk .row')
+          if (!row) return null
+          const act = row.querySelector('.c-act')
+          return {
+            buttons: [...act.querySelectorAll('.op')].map((b) => b.dataset.op || ''),
+            own: act.querySelectorAll('.op svg.op-svg').length,
+            elIcon: act.querySelectorAll('.op .el-icon').length,
+            seps: act.querySelectorAll('.op-sep').length
+          }
+        })()`)) as { buttons: string[]; own: number; elIcon: number; seps: number } | null
+        console.log(
+          `[smoke] ${
+            ops && ops.own === ops.buttons.length && ops.elIcon === 0 && ops.seps === 2 ? 'PASS' : 'FAIL'
+          } 操作列用统一图标并有 2 处分组：${JSON.stringify(ops)}`
+        )
+        // 运行中的容器，第一颗必须是"停止"，不能同时冒出"启动"
+        const hasStop = !!ops?.buttons?.includes('stop')
+        const hasStart = !!ops?.buttons?.includes('start')
+        console.log(
+          `[smoke] ${hasStop && !hasStart ? 'PASS' : 'FAIL'} 运行中容器的首颗是「停止」不是「启动」`
+        )
         await shot('thshell-docker-containers.png')
 
         // 日志弹窗（取第一个容器的日志按钮）
@@ -503,6 +558,39 @@ function createWindow(): void {
         await clickSeg('概览')
         await wait(2200)
         await shot('thshell-docker-overview.png')
+
+        /**
+         * 清理按钮行：点「一键清理」时按钮里会多出一个 loading 转圈图标。
+         * 原来这排是 flex 自动排，五颗加起来 ≈ 524px 而卡片可用宽度只有 523px ——
+         * 转圈图标一进来，最后一颗就被挤到下一行。
+         * 现在改成 grid 五等分，这里模拟一次"正在 loading"来钉住布局不变。
+         */
+        const prune = (await js(`(() => {
+          const row = document.querySelector('.prune-row')
+          if (!row) return null
+          const btns = [...row.querySelectorAll('.el-button')]
+          const tops = () => btns.map((b) => Math.round(b.getBoundingClientRect().top))
+          const before = tops()
+          // 手动插一个 Element Plus 风味的 loading 图标，等价于点下去那一瞬间
+          const target = btns[0]
+          const fake = document.createElement('i')
+          fake.className = 'el-icon is-loading'
+          fake.style.marginRight = '6px'
+          fake.innerHTML = '<svg viewBox="0 0 1024 1024" width="1em" height="1em"><path fill="currentColor" d="M512 64a32 32 0 1 1 0 64 32 32 0 0 1 0-64z"/></svg>'
+          target.insertBefore(fake, target.firstChild)
+          const during = tops()
+          const span = target.querySelector('span')
+          const fits = span ? span.scrollWidth <= span.clientWidth + 1 : false
+          fake.remove()
+          return { n: btns.length, before, during, fits }
+        })()`)) as { n: number; before: number[]; during: number[]; fits: boolean } | null
+        const oneRow = (t?: number[]) => !!t && new Set(t).size === 1
+        console.log(
+          `[smoke] ${prune && prune.n === 5 && oneRow(prune.before) && oneRow(prune.during) ? 'PASS' : 'FAIL'} 清理按钮点下去不换行：${JSON.stringify(prune)}`
+        )
+        console.log(
+          `[smoke] ${prune?.fits ? 'PASS' : 'FAIL'} 等宽后「清理停止的容器」文字没被省略号截断`
+        )
 
         await clickSeg('网络')
         await wait(1800)
@@ -550,7 +638,7 @@ function createWindow(): void {
        * uploaddir 模式：验证「上传文件夹」。
        * 造一个含子目录 + 空目录的本地临时目录，走 preload 的真链路 uploadDir 传到
        * 远程 /tmp，再用 ssh find 核对结构（空目录在不在是关键 —— 只传文件的话它会丢），
-       * 顺便截图「上传到远程」的下拉菜单。跑完两端都清理。
+       * 顺便钉住工具栏按钮的形态。跑完两端都清理。
        */
       if (mode === 'uploaddir') {
         const src = path.join(os.tmpdir(), 'thshell-upload-src')
@@ -571,18 +659,18 @@ function createWindow(): void {
         )
         await wait(2000)
 
-        // 下拉菜单截图：确认「上传文件夹」在菜单里
-        await js(
-          `[...document.querySelectorAll('footer button')].find((b) => b.textContent.includes('上传到远程'))?.click()`
+        // 工具栏的「上传到远程」是纯按钮：点下去直接选文件，不再挂下拉菜单。
+        // 文件夹上传走右键（本地目录 → 上传此目录；空白处 → 上传文件夹到此处）。
+        // 别真点它 —— 会弹系统文件选择框，冒烟直接挂住。
+        const uploadBtn = (await js(`(() => {
+          const b = [...document.querySelectorAll('footer button')]
+            .find((x) => x.textContent.includes('上传到远程'))
+          return b ? { text: b.textContent.trim(), caret: !!b.querySelector('.el-icon--right') } : null
+        })()`)) as { text: string; caret: boolean } | null
+        console.log(
+          `[smoke] ${uploadBtn && !uploadBtn.caret ? 'PASS' : 'FAIL'} 上传按钮是纯按钮（没有下拉三角）：${JSON.stringify(uploadBtn)}`
         )
-        await wait(700)
-        const menuLabels = (await js(
-          `[...document.querySelectorAll('.el-dropdown-menu__item')].map((e) => e.textContent.trim())`
-        )) as string[]
-        console.log(`[smoke] ${menuLabels.some((l) => l.includes('文件夹')) ? 'PASS' : 'FAIL'} 菜单=${JSON.stringify(menuLabels)}`)
-        await shot('thshell-upload-menu.png')
-        await js(`document.body.click()`)
-        await wait(400)
+        await shot('thshell-upload-btn.png')
 
         const sid = (await js(
           `window.__store?.tabs.find((t) => t.sessionId)?.sessionId || ''`
@@ -1964,7 +2052,25 @@ function createWindow(): void {
         await js(
           `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
         )
-        await wait(4000)
+
+        /**
+         * 建连那几秒面板全是空的，页签图标得转起来，否则用户看不出是在连还是点错了。
+         * SSH 握手通常 200ms 起步，这里 20ms 一采，抓得到。
+         */
+        const spinning = (await js(`(async () => {
+          const seen = new Set()
+          for (let i = 0; i < 80; i++) {
+            document.querySelectorAll('.seg-btn').forEach((b) => {
+              if (b.querySelector('.el-icon.spin')) seen.add((b.textContent || '').trim())
+            })
+            if (seen.size >= 4) break
+            await new Promise((r) => setTimeout(r, 20))
+          }
+          return [...seen]
+        })()`)) as string[]
+
+        await shot('files-seg-busy.png')
+        await wait(3500)
         await js(
           `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
         )
@@ -1981,6 +2087,16 @@ function createWindow(): void {
 
         const checks: [string, boolean, string][] = []
         const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        push('连接中页签图标转圈', spinning.length >= 4, spinning.join('/'))
+        // 数据到位后要停，不然一排永远不会停的圈比不转还糟
+        const stillSpin = (await js(`(() => {
+          const b = [...document.querySelectorAll('.seg-btn')].find((x) =>
+            (x.textContent || '').includes('文件')
+          )
+          return !!b?.querySelector('.el-icon.spin')
+        })()`)) as boolean
+        push('加载完文件页签停止转圈', !stillSpin)
 
         const rows = (await js(`(() => {
           const pane = document.querySelectorAll('.fm .pane')[0]
@@ -3796,8 +3912,52 @@ function createWindow(): void {
           ]
         })
 
+        // 慢速包用同一份字节：/slow.json 里的 sha256 和 /files/slow.bin 发的必须是同一份，
+        // 否则下载完会卡在校验上，测出来的"失败"是假的。
+        const slowPayload = cryptoMod.randomBytes(60 * 1024)
+        const slowSha = cryptoMod.createHash('sha256').update(slowPayload).digest('hex')
+
         const server = http.createServer((req, res) => {
           const url = (req.url || '/').split('?')[0]
+          // 慢速包：只给「后台下载」那组 UI 断言用。
+          // 80KB 在本地瞬间就下完了，不制造一点延迟根本观察不到"下载中"这个状态。
+          if (url === '/slow.json') {
+            res.setHeader('content-type', 'application/json')
+            res.end(
+              JSON.stringify({
+                version: '9.9.8',
+                publishedAt: new Date().toISOString(),
+                notes: '后台下载测试',
+                assets: [
+                  {
+                    platform: process.platform,
+                    arch,
+                    format,
+                    url: 'files/slow.bin',
+                    size: slowPayload.length,
+                    sha256: slowSha
+                  }
+                ]
+              })
+            )
+            return
+          }
+          if (url === '/files/slow.bin') {
+            res.setHeader('content-type', 'application/octet-stream')
+            res.setHeader('content-length', String(slowPayload.length))
+            let off = 0
+            const timer = setInterval(() => {
+              if (off >= slowPayload.length) {
+                clearInterval(timer)
+                res.end()
+                return
+              }
+              res.write(slowPayload.subarray(off, off + 8 * 1024))
+              off += 8 * 1024
+            }, 130)
+            req.on('close', () => clearInterval(timer))
+            return
+          }
           if (url === '/new.json') {
             res.setHeader('content-type', 'application/json')
             res.end(JSON.stringify(manifestOf('9.9.9', goodSha)))
@@ -3866,7 +4026,7 @@ function createWindow(): void {
 
         // 2. 有新版本
         const newer = await checkForUpdates(`${base}/new.json`)
-        push('查到新版本', newer.hasUpdate && newer.latest === '9.9.9', `${newer.current} → ${newer.latest ?? '无'}`)
+        push('查到新版本', newer.hasUpdate && newer.latest === '9.9.9', `${newer.current} → ${newer.latest ?? '无'}${newer.error ? ' / ' + newer.error : ''}`)
         push('挑出了本平台的包', !!newer.asset, newer.asset ? `${newer.asset.platform}/${newer.asset.arch}/${newer.asset.format}` : '无')
         push('相对地址解析成了绝对地址', !!newer.asset?.url.startsWith(base), newer.asset?.url ?? '')
 
@@ -3999,6 +4159,97 @@ function createWindow(): void {
           allErr.includes('所有下载地址') && allErr.includes('主源'),
           allErr.slice(0, 70)
         )
+
+        // 11. 后台下载：关掉弹窗继续下、状态栏给进度、下完不自动装
+        const prevFeed = (await js(`window.__store?.config.settings.updateFeed || ''`)) as string
+        await js(
+          `window.__store.config.settings.updateFeed = ${JSON.stringify(`${base}/slow.json`)}`
+        )
+        await js(`document.querySelectorAll('.menubar .el-dropdown .mb')[0]?.click()`)
+        await wait(500)
+        await js(
+          `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')]
+            .find((i) => i.textContent.includes('检查更新'))?.click()`
+        )
+
+        const dlgButton = (text: string) => `(() => {
+          const d = [...document.querySelectorAll('.el-dialog')]
+            .filter((el) => el.getBoundingClientRect().width > 0).pop()
+          if (!d) return false
+          return [...d.querySelectorAll('button')].some((b) => b.textContent.includes(${JSON.stringify(text)}))
+        })()`
+
+        let hasBg = false
+        for (let i = 0; i < 16; i += 1) {
+          await wait(250)
+          hasBg = (await js(dlgButton('后台下载'))) as boolean
+          if (hasBg) break
+        }
+        push('检查更新里有「后台下载」按钮', hasBg)
+
+        await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')]
+            .filter((el) => el.getBoundingClientRect().width > 0).pop()
+          if (d) [...d.querySelectorAll('button')].find((b) => b.textContent.includes('后台下载'))?.click()
+        })()`)
+        await wait(400)
+        push(
+          '点后台下载后弹窗关掉了',
+          (await js(
+            `[...document.querySelectorAll('.el-dialog')].filter((el) => el.getBoundingClientRect().width > 0).length === 0`
+          )) as boolean
+        )
+
+        // 状态栏那颗 chip 是用户唯一的线索：没有它，关窗之后就彻底不知道下到哪儿了
+        const chipOf = `document.querySelector('.statusbar .chip.upd')?.textContent?.trim() || ''`
+        let chipText = ''
+        for (let i = 0; i < 12; i += 1) {
+          await wait(150)
+          chipText = ((await js(chipOf)) as string) || ''
+          if (/\d+%/.test(chipText)) break
+        }
+        push('状态栏显示后台下载进度', /\d+%/.test(chipText), chipText)
+        await shot('thshell-update-bg.png')
+
+        let readyText = chipText
+        for (let i = 0; i < 40; i += 1) {
+          await wait(250)
+          readyText = ((await js(chipOf)) as string) || ''
+          if (readyText.includes('已下载')) break
+        }
+        push('下完后状态栏提示可以安装', readyText.includes('已下载'), readyText)
+        push(
+          '下载完成时弹了通知',
+          (await js(`!!document.querySelector('.el-notification')`)) as boolean
+        )
+
+        // 点状态栏那颗 chip 回到弹窗：已经下好的包不该再让人等一遍
+        await js(`document.querySelector('.statusbar .chip.upd')?.click()`)
+        await wait(800)
+        const backText = ((await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')]
+            .filter((el) => el.getBoundingClientRect().width > 0).pop()
+          return d ? (d.textContent || '') : ''
+        })()`)) as string) || ''
+        push(
+          '再打开时认得已下载的包',
+          backText.includes('已下载完成') && ((await js(dlgButton('安装'))) as boolean),
+          backText.slice(0, 40)
+        )
+
+        // 收尾：重新检查会主动丢掉旧包，更新源还原成原值 —— 后面那段要打开弹窗
+        // 看"检查更新"的界面，不能被这个本地地址带偏（server 马上要关）
+        await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')]
+            .filter((el) => el.getBoundingClientRect().width > 0).pop()
+          if (d) [...d.querySelectorAll('button')].find((b) => b.textContent.includes('重新检查'))?.click()
+        })()`)
+        await wait(900)
+        await js(`window.__store.config.settings.updateFeed = ${JSON.stringify(prevFeed || '')}`)
+        await js(`[...document.querySelectorAll('.el-dialog')]
+          .filter((el) => el.getBoundingClientRect().width > 0)
+          .pop()?.querySelector('.el-dialog__headerbtn')?.click()`)
+        await wait(300)
 
         server.close()
 

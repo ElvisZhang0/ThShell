@@ -1,8 +1,20 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useAppStore } from '../stores/app'
+import { updateState } from '../utils/update-state'
 
 const store = useAppStore()
+const emit = defineEmits<{ (e: 'open-update'): void }>()
+
+/** 状态栏原来写死 "ThShell 0.1"，发了这么多版一直是错的；问主进程要真的版本号 */
+const appVersion = ref('')
+onMounted(async () => {
+  try {
+    appVersion.value = await window.api.app.version()
+  } catch {
+    /* 拿不到就只显示名字，不值得为此报错 */
+  }
+})
 
 const active = computed(() => store.activeTab)
 
@@ -24,6 +36,27 @@ const summary = computed(() => {
   return parts.join(' · ') || '0 个活动连接'
 })
 const activeTransfer = computed(() => store.transfers.filter((t) => !t.done).length)
+
+/**
+ * 后台下载的落地位置。
+ *
+ * 弹窗一关，用户手上就只剩状态栏这一条线索了 —— 没有它，下载在不在跑、
+ * 下了多少、下完了没有，全都只能靠猜。点击回到检查更新弹窗。
+ */
+const updateChip = computed(() => {
+  const s = updateState
+  if (s.downloading) {
+    const pct = s.progress.percent
+    return { kind: 'busy' as const, text: `↓ 更新${s.result?.latest ? ' ' + s.result.latest : ''} ${pct}%` }
+  }
+  if (s.filePath && !s.launched) {
+    return {
+      kind: 'ready' as const,
+      text: `更新${s.result?.latest ? ' ' + s.result.latest : ''} 已下载 · 点击安装`
+    }
+  }
+  return null
+})
 </script>
 
 <template>
@@ -34,12 +67,21 @@ const activeTransfer = computed(() => store.transfers.filter((t) => !t.done).len
       </span>
       <span v-if="active" class="chip mono">{{ active.subtitle }}</span>
       <span v-if="activeTransfer" class="chip transfer">↑↓ {{ activeTransfer }} 个传输中</span>
+      <button
+        v-if="updateChip"
+        class="chip upd"
+        :class="updateChip.kind"
+        :title="updateChip.kind === 'busy' ? '后台下载进行中，点击查看进度' : '更新包已下载，点击安装'"
+        @click="emit('open-update')"
+      >
+        {{ updateChip.text }}
+      </button>
     </div>
 
     <div class="right">
       <span class="muted">UTF-8</span>
       <span class="sep" />
-      <span class="muted">ThShell 0.1</span>
+      <span class="muted">ThShell{{ appVersion ? ' ' + appVersion : '' }}</span>
     </div>
   </footer>
 </template>
@@ -90,6 +132,25 @@ const activeTransfer = computed(() => store.transfers.filter((t) => !t.done).len
 
 .chip.transfer {
   color: var(--accent);
+}
+
+/* 后台下载的入口。做成按钮是因为它可点，但不能长得像按钮 ——
+   状态栏里塞一颗实心按钮会把"这条是系统状态"的层级搞乱 */
+.chip.upd {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.chip.upd:hover {
+  text-decoration: underline;
+}
+
+.chip.upd.ready {
+  color: var(--success);
 }
 
 .muted {

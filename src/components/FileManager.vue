@@ -45,6 +45,7 @@ import OfficePreview from './OfficePreview.vue'
 import MarkdownPreview from './MarkdownPreview.vue'
 import PdfPreview from './PdfPreview.vue'
 import { formatSize } from '../utils/transfer-format'
+import { usePaneBusy } from '../utils/pane-busy'
 import type { MenuItem } from './FileContextMenu.vue'
 
 /** 内置编辑器的视图模式：只有 markdown 用得上分栏/纯预览 */
@@ -66,7 +67,7 @@ const localSelected = ref<FileEntry | null>(null)
 const remoteSelected = ref<FileEntry | null>(null)
 const loadingLocal = ref(false)
 const loadingRemote = ref(false)
-const busy = ref(false)
+usePaneBusy('files', loadingLocal, loadingRemote)
 
 /** 远程 $HOME，用于「跳转 → 主目录」，连接后才知道 */
 const remoteHome = ref('')
@@ -487,7 +488,6 @@ async function copyText(text: string, tip: string) {
 /** 右键某个本地文件 → 直接传到当前远程目录，不用再走文件选择框 */
 async function uploadOne(filePath: string) {
   const name = filePath.split(/[\\/]/).pop() ?? 'upload.bin'
-  busy.value = true
   try {
     // 取消时返回空串：不算失败，也不该报"已上传"
     const ok = await window.api.sftp.upload(
@@ -500,8 +500,6 @@ async function uploadOne(filePath: string) {
     else ElMessage.info('已取消上传')
   } catch (err) {
     ElMessage.error('上传失败：' + cleanError(err))
-  } finally {
-    busy.value = false
   }
 }
 
@@ -607,7 +605,6 @@ async function doPaste(side: 'local' | 'remote') {
   const failed: { path: string; message: string }[] = []
   let done = 0
 
-  busy.value = true
   try {
     if (kind === 'same') {
       const paths = clip.entries.map((e) => e.path)
@@ -673,7 +670,6 @@ async function doPaste(side: 'local' | 'remote') {
       }
     }
   } finally {
-    busy.value = false
     // 剪切是一次性的：成功或失败都清掉，避免用户以为还能再粘一次
     if (clip.mode === 'cut') store.setClipboard(null)
     // 两侧都刷：剪切会改动源目录，跨栏粘贴会同时影响两栏
@@ -1256,14 +1252,11 @@ async function deleteRemote() {
       '删除远程文件',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
     )
-    busy.value = true
     await window.api.sftp.remove(props.tab.sessionId, target.path, target.isDir)
     await loadRemote()
     ElMessage.success('已删除')
   } catch (err) {
     if (err !== 'cancel' && err !== 'close') ElMessage.error(cleanError(err))
-  } finally {
-    busy.value = false
   }
 }
 
@@ -1291,7 +1284,6 @@ async function upload() {
   try {
     const files = await window.api.dialog.pickFiles()
     if (!files.length) return
-    busy.value = true
     let sent = 0
     for (const file of files) {
       const name = file.split(/[\\/]/).pop() ?? 'upload.bin'
@@ -1309,8 +1301,6 @@ async function upload() {
     if (sent < files.length) ElMessage.info(`已取消，还有 ${files.length - sent} 个没传`)
   } catch (err) {
     ElMessage.error('上传失败：' + cleanError(err))
-  } finally {
-    busy.value = false
   }
 }
 
@@ -1346,7 +1336,6 @@ async function uploadFolderTo(localDir: string, remoteDir: string) {
       return
     }
   }
-  busy.value = true
   try {
     const result = await window.api.sftp.uploadDir(
       props.tab.sessionId,
@@ -1369,8 +1358,6 @@ async function uploadFolderTo(localDir: string, remoteDir: string) {
     }
   } catch (err) {
     ElMessage.error('上传目录失败：' + cleanError(err))
-  } finally {
-    busy.value = false
   }
 }
 
@@ -1384,7 +1371,6 @@ async function uploadDir() {
 async function download() {
   if (!remoteSelected.value) return
   const target = remoteSelected.value
-  busy.value = true
   try {
     if (target.isDir) {
       // 目录：在本地当前目录下建同名文件夹，递归拉取
@@ -1419,8 +1405,6 @@ async function download() {
     }
   } catch (err) {
     ElMessage.error('下载失败：' + cleanError(err))
-  } finally {
-    busy.value = false
   }
 }
 
@@ -1583,23 +1567,11 @@ onBeforeUnmount(() => {
             />
           </el-tooltip>
           <div class="grow" />
-          <!-- 一个按钮两件事：文件走多选、目录走递归上传，默认点主按钮仍是传文件 -->
-          <el-dropdown
-            trigger="click"
-            placement="top-end"
-            :disabled="busy"
-            @command="(cmd: string) => (cmd === 'folder' ? uploadDir() : upload())"
-          >
-            <el-button text size="small" type="primary" :icon="Upload" :loading="busy">
-              上传到远程<el-icon class="el-icon--right"><CaretBottom /></el-icon>
-            </el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="files">上传文件…</el-dropdown-item>
-                <el-dropdown-item command="folder">上传文件夹…（含子目录）</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+          <!-- 上传中不禁用：传输任务在主进程里是按 id 分开管的，本来就能并行排队，
+               锁住按钮只是让人看着像坏了。文件夹上传走右键（本地目录 / 空白处都有入口） -->
+          <el-button text size="small" type="primary" :icon="Upload" @click="upload()">
+            上传到远程
+          </el-button>
         </footer>
       </section>
 
@@ -1714,7 +1686,6 @@ onBeforeUnmount(() => {
             type="primary"
             :icon="Download"
             :disabled="!remoteSelected"
-            :loading="busy"
             @click="download"
           >
             下载到本地

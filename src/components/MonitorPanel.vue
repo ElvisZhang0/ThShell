@@ -4,12 +4,16 @@ import { Cpu, Odometer, Coin, Connection } from '@element-plus/icons-vue'
 import { useAppStore } from '../stores/app'
 import type { Tab } from '../stores/app'
 import MiniChart from './MiniChart.vue'
+import { usePaneBusy } from '../utils/pane-busy'
 
 const props = defineProps<{ tab: Tab }>()
 const store = useAppStore()
 
 const history = computed(() => store.metrics[props.tab.sessionId] ?? [])
 const latest = computed(() => history.value[history.value.length - 1])
+
+/** 指标由主进程按周期推，第一个采样点到达之前画不出来东西 */
+usePaneBusy('monitor', computed(() => history.value.length === 0))
 
 const cpuSeries = computed(() => history.value.map((m) => m.cpu))
 const memSeries = computed(() =>
