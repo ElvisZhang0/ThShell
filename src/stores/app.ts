@@ -10,7 +10,14 @@ import type {
   TransferRecord
 } from '../../electron/types'
 
-export type ViewKind = 'terminal' | 'files' | 'monitor' | 'system' | 'docker'
+export type ViewKind =
+  | 'terminal'
+  | 'files'
+  | 'monitor'
+  | 'procs'
+  | 'system'
+  | 'services'
+  | 'docker'
 
 /** 文件剪贴板的一条记录，只存粘贴时需要的最小信息 */
 export interface ClipEntry {
@@ -365,22 +372,35 @@ export const useAppStore = defineStore('app', {
 
     startMetricsLoop() {
       if (this.metricsTimer) return
+      /**
+       * 一轮要按标签串行地跑完所有已连接会话（每次都过一次 SSH）。
+       * 两个坑都在这里堵：
+       * - 窗口在后台、或者整本 App 被最小化时没人看曲线，没必要一台台去问；
+       * - 服务器慢的时候一轮跑不完 3 秒，setInterval 会再叠一层，
+       *   叠上几轮就变成"一直在采样"，整个应用跟着卡（进程页再一开就顶不住了）。
+       */
+      let busy = false
       this.metricsTimer = setInterval(async () => {
         const interval = this.config.settings.metricInterval
-        if (!interval) return
-        for (const tab of this.connectedTabs) {
-          if (!tab.sessionId) continue
-          try {
-            const snapshot = await window.api.ssh.metrics(tab.sessionId)
-            if (!snapshot) continue
-            const history = this.metrics[tab.sessionId] ?? []
-            history.push(snapshot)
-            // 只留最近 60 个采样点，够画 3 分钟趋势
-            if (history.length > 60) history.shift()
-            this.metrics[tab.sessionId] = history
-          } catch {
-            /* 单次采集失败不打断循环 */
+        if (!interval || document.hidden || busy) return
+        busy = true
+        try {
+          for (const tab of this.connectedTabs) {
+            if (!tab.sessionId) continue
+            try {
+              const snapshot = await window.api.ssh.metrics(tab.sessionId)
+              if (!snapshot) continue
+              const history = this.metrics[tab.sessionId] ?? []
+              history.push(snapshot)
+              // 只留最近 60 个采样点，够画 3 分钟趋势
+              if (history.length > 60) history.shift()
+              this.metrics[tab.sessionId] = history
+            } catch {
+              /* 单次采集失败不打断循环 */
+            }
           }
+        } finally {
+          busy = false
         }
       }, Math.max(1000, this.config.settings.metricInterval || 3000))
     },

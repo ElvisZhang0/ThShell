@@ -4,10 +4,12 @@ import {
   Box,
   Cpu,
   FolderOpened,
+  List,
   Loading,
   Monitor,
   Odometer,
   RefreshRight,
+  SetUp,
   WarningFilled
 } from '@element-plus/icons-vue'
 import { useAppStore } from '../stores/app'
@@ -16,7 +18,9 @@ import { providePaneBusy } from '../utils/pane-busy'
 import TerminalView from './TerminalView.vue'
 import FileManager from './FileManager.vue'
 import MonitorPanel from './MonitorPanel.vue'
+import ProcessPanel from './ProcessPanel.vue'
 import SystemPanel from './SystemPanel.vue'
+import ServicePanel from './ServicePanel.vue'
 import DockerPanel from './DockerPanel.vue'
 
 const props = defineProps<{ tab: Tab }>()
@@ -28,7 +32,9 @@ const views: { key: ViewKind; label: string; icon: typeof Monitor }[] = [
   { key: 'terminal', label: '终端', icon: Monitor },
   { key: 'files', label: '文件', icon: FolderOpened },
   { key: 'monitor', label: '监控', icon: Odometer },
-  { key: 'system', label: '系统', icon: Cpu }
+  { key: 'procs', label: '进程', icon: List },
+  { key: 'system', label: '系统', icon: Cpu },
+  { key: 'services', label: '系统服务', icon: SetUp }
 ]
 
 /**
@@ -154,7 +160,9 @@ function spinning(kind: ViewKind): boolean {
         <template v-if="!isLocal">
           <FileManager v-show="tab.view === 'files'" :tab="tab" />
           <MonitorPanel v-show="tab.view === 'monitor'" :tab="tab" />
+          <ProcessPanel v-show="tab.view === 'procs'" :tab="tab" />
           <SystemPanel v-show="tab.view === 'system'" :tab="tab" />
+          <ServicePanel v-show="tab.view === 'services'" :tab="tab" />
           <DockerPanel v-if="hasDocker" v-show="tab.view === 'docker'" :tab="tab" />
         </template>
       </template>

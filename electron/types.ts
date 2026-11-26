@@ -183,6 +183,135 @@ export interface MetricSnapshot {
   processes: number
 }
 
+/**
+ * 进程监控里的一行。
+ * cpu 是**瞬时**占用（两次采样求差），口径和 htop 一致：一个核跑满 = 100%，
+ * 所以多核机器上所有进程加起来可以超过 100。
+ */
+export interface ProcRow {
+  pid: number
+  ppid: number
+  user: string
+  /** R / S / D / Z / T … */
+  state: string
+  threads: number
+  /** KB */
+  rss: number
+  cpu: number
+  mem: number
+  cmd: string
+}
+
+/** 进程页顶部的概要（htop 那几条 meter 用的数） */
+export interface ProcStats {
+  /** 服务器上的进程总数；rows 可能被截断 */
+  total: number
+  running: number
+  sleeping: number
+  zombie: number
+  threads: number
+  cores: number
+  /** 全机瞬时占用（两次采样求差），0-100 */
+  cpu: number
+  load1: number
+  load5: number
+  load15: number
+  memTotal: number
+  memUsed: number
+  swapTotal: number
+  swapUsed: number
+}
+
+export interface ProcSnapshot {
+  time: number
+  rows: ProcRow[]
+  stats: ProcStats
+  /** htop 是否装了；没装就得按发行版给安装命令 */
+  htop: {
+    available: boolean
+    path: string
+    /** 探测到的包管理器：apt / dnf / yum / zypper / apk / pacman / unknown */
+    pkg: string
+    /** 直接可复制的安装命令 */
+    install: string
+    /** 发行版名，用于提示文案 */
+    os: string
+  }
+}
+
+/**
+ * 一个 systemd 服务（.service 单元）。
+ *
+ * 数据来自两份 systemctl 输出合并：`list-units --all`（运行状态）和
+ * `list-unit-files`（开机自启态）。没被加载的 unit 只有后者有，
+ * 这时 active 为空、loaded 为 false —— 界面显示「未加载」，
+ * 不能谎报成「已停止」（用户可能正要去启动它）。
+ */
+export interface ServiceRow {
+  /** 完整单元名，如 cron.service / getty@tty1.service */
+  name: string
+  /** loaded / not-found / masked … */
+  load: string
+  /** active / inactive / failed / activating / reloading … */
+  active: string
+  /** running / dead / exited / failed … */
+  sub: string
+  description: string
+  /** 开机自启态：enabled / disabled / static / masked / indirect … */
+  enabled: string
+  /** 是否已被 systemd 加载进内存 */
+  loaded: boolean
+}
+
+export interface ServiceStats {
+  total: number
+  running: number
+  failed: number
+  /** 已加载但没在跑（不含 failed） */
+  inactive: number
+}
+
+export interface ServiceSnapshot {
+  time: number
+  rows: ServiceRow[]
+  stats: ServiceStats
+  systemd: {
+    /** 这台机器有没有 systemd：容器 / WSL / sysvinit 机器上会是 false */
+    available: boolean
+    /** 1 号进程的 comm，如 systemd / init / tini */
+    init: string
+    version: string
+    /** 不可用时的原因（直接给运维看的那句原始报错） */
+    hint: string
+  }
+}
+
+/** 服务的三个动作。只给这三个 —— 开机自启开关属于「改配置」，不在这里做 */
+export type ServiceAction = 'start' | 'stop' | 'restart'
+
+/** 拉服务日志的参数 */
+export interface ServiceLogQuery {
+  /** 首屏要多少行；增量时是单次上限 */
+  lines: number
+  /** 增量游标：`YYYY-MM-DD HH:MM:SS`，空表示拉首屏 */
+  since?: string
+  /** 游标那一秒里上次已经返回过多少行（--since 是闭区间，不跳过就重复） */
+  skip?: number
+}
+
+export interface ServiceLogResult {
+  lines: string[]
+  /** 下一轮增量用的游标 */
+  cursor: string
+  /** 游标那一秒里已经返回过的行数 */
+  cursorCount: number
+  /** 日志是普通账号读的，还是靠 sudo 读的 */
+  source: 'user' | 'sudo'
+  /** 需要让用户知道的事（权限不足等）—— 不是错误，但会影响能看到什么 */
+  note: string
+  at: number
+}
+
 /** 一个挂载点的磁盘占用 */
 export interface DiskMount {
   device: string
@@ -208,6 +337,67 @@ export interface NetInterface {
   mac: string
   ipv4: string[]
   ipv6: string[]
+}
+
+/**
+ * 一块「有设备节点、但没挂到任何目录」的磁盘/分区。
+ * 来源是 lsblk 而不是 df —— df 只列已经挂上的，恰恰漏掉要找的那些。
+ */
+export interface UnmountedDisk {
+  /** 设备路径，如 /dev/sdb1 */
+  path: string
+  /** lsblk 的人类可读容量，如 20G */
+  size: string
+  /** 空字符串表示还没格式化，这时候不能直接 mount */
+  fstype: string
+  label: string
+  /** 所属磁盘型号，多块盘时靠它区分是哪一块 */
+  model: string
+  /** part / disk / lvm … */
+  type: string
+  /** 已经做过 swap 的分区：列出来但别让人往目录上挂 */
+  isSwap: boolean
+}
+
+export interface MountRequest {
+  device: string
+  mountPoint: string
+  fstype: string
+  /** 写入 /etc/fstab，开机自动挂载 */
+  persist: boolean
+}
+
+/** 远端配置类写操作的统一回执；ok=false 时 log 里是完整报错 */
+export interface ConfigResult {
+  ok: boolean
+  log: string
+}
+
+export type NetBackend = 'nmcli' | 'ifcfg' | 'netplan' | 'none'
+
+/** 某张网卡当前的地址配置（读出来填进表单，改完再写回去） */
+export interface NetConfigInfo {
+  backend: NetBackend
+  device: string
+  /** nmcli 的连接名，跟设备名不一定一样 */
+  connName: string
+  method: 'dhcp' | 'manual'
+  /** CIDR 形式，如 172.30.10.206/22 */
+  addresses: string[]
+  gateway: string
+  dns: string[]
+  /** 后端说明或者「为什么改不了」 */
+  hint: string
+}
+
+export interface NetConfigApply {
+  device: string
+  backend: NetBackend
+  connName: string
+  method: 'dhcp' | 'manual'
+  addresses: string[]
+  gateway: string
+  dns: string[]
 }
 
 /** 一条登录会话（who 的输出） */
@@ -613,8 +803,32 @@ export interface ThShellApi {
     exec: (sessionId: string, command: string) => Promise<ExecResult>
     metrics: (sessionId: string) => Promise<MetricSnapshot | null>
     sysinfo: (sessionId: string) => Promise<SystemInfo | null>
+    procs: (sessionId: string) => Promise<ProcSnapshot>
+    killProc: (sessionId: string, pid: number, force: boolean) => Promise<string>
     onData: (cb: (payload: { sessionId: string; data: string }) => void) => () => void
     onState: (cb: (payload: SessionState) => void) => () => void
+  }
+  /**
+   * 系统页上的写操作（挂载磁盘 / 配置网卡）。
+   * 单独开一个命名空间而不是挂进 ssh：这两个是"会改远端机器"的动作，
+   * 出问题时需要一眼看出调用的是只读采集还是写操作。
+   */
+  syscfg: {
+    disks: (sessionId: string) => Promise<UnmountedDisk[]>
+    mount: (sessionId: string, req: MountRequest) => Promise<ConfigResult>
+    netConfig: (sessionId: string, device: string) => Promise<NetConfigInfo>
+    netApply: (sessionId: string, req: NetConfigApply) => Promise<ConfigResult>
+  }
+  /**
+   * 系统服务（systemd）。
+   * 单独一层而不是塞进 ssh：这里会改远端机器的运行状态，
+   * 和 ssh.exec 那种"随便跑条命令"的性质要分开。
+   */
+  services: {
+    list: (sessionId: string) => Promise<ServiceSnapshot>
+    action: (sessionId: string, name: string, action: ServiceAction) => Promise<string>
+    /** 某个服务的 journalctl 日志；不传 since 就是首屏 */
+    logs: (sessionId: string, name: string, query: ServiceLogQuery) => Promise<ServiceLogResult>
   }
   /**
    * 本地终端（本机 shell，走 PTY）。
@@ -739,7 +953,7 @@ export interface ThShellApi {
       action: 'start' | 'stop' | 'restart' | 'pause' | 'unpause' | 'kill' | 'remove',
       force?: boolean
     ) => Promise<string>
-    containerLogs: (sessionId: string, id: string, tail?: number) => Promise<string>
+    containerLogs: (sessionId: string, id: string, tail?: number, since?: string) => Promise<string>
     containerDetail: (sessionId: string, id: string) => Promise<DockerContainerDetail>
     images: (sessionId: string) => Promise<DockerImage[]>
     pullImage: (sessionId: string, ref: string) => Promise<string>

@@ -1,10 +1,29 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { CaretRight, Coin, Cpu, Link, Monitor, Odometer, Refresh, User } from '@element-plus/icons-vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import {
+  CaretRight,
+  Coin,
+  Cpu,
+  FolderAdd,
+  Link,
+  Monitor,
+  Odometer,
+  Refresh,
+  Setting,
+  User,
+  WarningFilled
+} from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Tab } from '../stores/app'
 import { cleanError } from '../stores/app'
 import { usePaneBusy } from '../utils/pane-busy'
-import type { LoginSession, SystemInfo } from '../../electron/types'
+import type {
+  LoginSession,
+  NetBackend,
+  NetInterface,
+  SystemInfo,
+  UnmountedDisk
+} from '../../electron/types'
 
 const props = defineProps<{ tab: Tab }>()
 
@@ -31,6 +50,8 @@ async function load() {
     unsupported.value = false
     info.value = data
     loadedAt.value = Date.now()
+    // 未挂载磁盘跟系统档案一起刷：df 看不到它们，得单独问一次 lsblk
+    void loadDisks()
   } catch (err) {
     error.value = cleanError(err)
   } finally {
@@ -125,6 +146,236 @@ const extraNets = computed(() =>
   realNets.value.length ? (info.value?.nets ?? []).filter((n) => VIRTUAL_IFACE.test(n.name)) : []
 )
 const showExtraNets = ref(false)
+
+/* ================= 未挂载磁盘 ================= */
+
+const unmounted = ref<UnmountedDisk[]>([])
+const diskLoading = ref(false)
+const diskError = ref('')
+
+async function loadDisks(): Promise<void> {
+  const sessionId = props.tab.sessionId
+  if (!sessionId) return
+  diskLoading.value = true
+  diskError.value = ''
+  try {
+    unmounted.value = await window.api.syscfg.disks(sessionId)
+  } catch (err) {
+    // 老机器可能没有 lsblk：不当成错误页，给一句说明就够了
+    unmounted.value = []
+    diskError.value = cleanError(err)
+  } finally {
+    diskLoading.value = false
+  }
+}
+
+const mountOpen = ref(false)
+const mountBusy = ref(false)
+const mountLog = ref('')
+const mountTarget = ref<UnmountedDisk | null>(null)
+const mountForm = reactive({ device: '', mountPoint: '', fstype: '', persist: true })
+
+/** /dev/sdb1 + 卷标 → /mnt/data；没有卷标就用设备名，别给个空输入框 */
+function suggestMountPoint(d: UnmountedDisk): string {
+  const raw = d.label || d.path.replace(/^\/dev\//, '')
+  const safe = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return `/mnt/${safe || 'disk'}`
+}
+
+function openMount(d: UnmountedDisk): void {
+  mountTarget.value = d
+  mountForm.device = d.path
+  mountForm.fstype = d.fstype
+  mountForm.mountPoint = suggestMountPoint(d)
+  mountForm.persist = true
+  mountLog.value = ''
+  mountOpen.value = true
+}
+
+async function doMount(): Promise<void> {
+  const sessionId = props.tab.sessionId
+  if (!sessionId || mountBusy.value) return
+  const mountPoint = mountForm.mountPoint.trim()
+  if (!mountPoint.startsWith('/')) {
+    ElMessage.warning('挂载点要写成绝对路径，例如 /data')
+    return
+  }
+
+  if (mountForm.persist) {
+    try {
+      await ElMessageBox.confirm(
+        `把 ${mountForm.device} 挂到 ${mountPoint}，并在 /etc/fstab 追加一行（原文件会自动备份）。`,
+        '挂载并开机自动挂载',
+        { type: 'warning', confirmButtonText: '挂载', cancelButtonText: '取消' }
+      )
+    } catch {
+      return
+    }
+  }
+
+  mountBusy.value = true
+  try {
+    const res = await window.api.syscfg.mount(sessionId, {
+      device: mountForm.device,
+      mountPoint,
+      fstype: mountForm.fstype,
+      persist: mountForm.persist
+    })
+    mountLog.value = res.log
+    if (res.ok) {
+      ElMessage.success(`${mountForm.device} 已挂到 ${mountPoint}`)
+      mountOpen.value = false
+      loadedAt.value = 0
+      await Promise.all([load(), loadDisks()])
+    } else {
+      ElMessage.error('挂载失败，看弹窗里的输出')
+    }
+  } catch (err) {
+    mountLog.value = cleanError(err)
+    ElMessage.error('挂载失败')
+  } finally {
+    mountBusy.value = false
+  }
+}
+
+/* ================= 网络配置 ================= */
+
+const netOpen = ref(false)
+const netLoading = ref(false)
+const netBusy = ref(false)
+const netLog = ref('')
+const netCfg = ref<{ backend: NetBackend; hint: string } | null>(null)
+const netForm = reactive({
+  device: '',
+  backend: 'none' as NetBackend,
+  connName: '',
+  method: 'manual' as 'dhcp' | 'manual',
+  ip: '',
+  prefix: '24',
+  gateway: '',
+  dns: ''
+})
+
+/** 打开时先用 sysinfo 里已经采到的地址垫底，探测回来再覆盖 —— 不然要等两次往返才有内容 */
+async function openNet(n: NetInterface): Promise<void> {
+  const sessionId = props.tab.sessionId
+  if (!sessionId) return
+
+  const first = n.ipv4[0] ?? ''
+  const [ip, prefix] = first.split('/')
+  netForm.device = n.name
+  netForm.backend = 'none'
+  netForm.connName = ''
+  netForm.method = first ? 'manual' : 'dhcp'
+  netForm.ip = ip ?? ''
+  netForm.prefix = prefix || '24'
+  netForm.gateway = info.value?.gateways[0] ?? ''
+  netForm.dns = (info.value?.dns ?? []).join(', ')
+  netCfg.value = null
+  netLog.value = ''
+  netOpen.value = true
+
+  netLoading.value = true
+  try {
+    const cfg = await window.api.syscfg.netConfig(sessionId, n.name)
+    netCfg.value = { backend: cfg.backend, hint: cfg.hint }
+    netForm.backend = cfg.backend
+    netForm.connName = cfg.connName
+    if (cfg.addresses.length || cfg.method === 'dhcp') {
+      netForm.method = cfg.method
+      if (cfg.addresses[0]) {
+        const [cfgIp, cfgPrefix] = cfg.addresses[0].split('/')
+        netForm.ip = cfgIp ?? netForm.ip
+        netForm.prefix = cfgPrefix || netForm.prefix
+      }
+      if (cfg.gateway) netForm.gateway = cfg.gateway
+      if (cfg.dns.length) netForm.dns = cfg.dns.join(', ')
+    }
+  } catch (err) {
+    netLog.value = cleanError(err)
+  } finally {
+    netLoading.value = false
+  }
+}
+
+const backendText = computed(() => {
+  const map: Record<NetBackend, string> = {
+    nmcli: 'NetworkManager',
+    ifcfg: 'ifcfg 文件',
+    netplan: 'netplan',
+    none: '未识别'
+  }
+  return map[netForm.backend] ?? netForm.backend
+})
+
+async function doApplyNet(): Promise<void> {
+  const sessionId = props.tab.sessionId
+  if (!sessionId || netBusy.value) return
+
+  if (netForm.method === 'manual') {
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(netForm.ip.trim())) {
+      ElMessage.warning('IP 地址格式不对')
+      return
+    }
+    const prefix = Number(netForm.prefix)
+    if (!Number.isInteger(prefix) || prefix < 1 || prefix > 32) {
+      ElMessage.warning('前缀长度要在 1-32 之间')
+      return
+    }
+    if (netForm.gateway && !/^\d{1,3}(\.\d{1,3}){3}$/.test(netForm.gateway.trim())) {
+      ElMessage.warning('网关格式不对')
+      return
+    }
+  }
+
+  const newAddr = netForm.method === 'manual' ? `${netForm.ip.trim()}/${netForm.prefix}` : 'DHCP'
+  const oldAddr = info.value?.nets.find((n) => n.name === netForm.device)?.ipv4[0] ?? ''
+  const changesIp = netForm.method === 'manual' && !!oldAddr && !oldAddr.startsWith(`${netForm.ip.trim()}/`)
+
+  try {
+    await ElMessageBox.confirm(
+      changesIp
+        ? `地址从 ${oldAddr} 改成 ${newAddr}：应用的一瞬间这条 SSH 就断了，需要用新地址重连。`
+        : `将写入 ${newAddr}，并重启 ${netForm.device} 的网络。连接可能短暂中断。`,
+      '应用网络配置',
+      { type: 'warning', confirmButtonText: '保存并应用', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+
+  netBusy.value = true
+  try {
+    const res = await window.api.syscfg.netApply(sessionId, {
+      device: netForm.device,
+      backend: netForm.backend,
+      connName: netForm.connName,
+      method: netForm.method,
+      addresses: netForm.method === 'manual' ? [newAddr] : [],
+      gateway: netForm.method === 'manual' ? netForm.gateway.trim() : '',
+      dns: netForm.dns
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    })
+    netLog.value = res.log
+    if (res.ok) {
+      ElMessage.success('已提交，1 秒后生效')
+      if (changesIp) netOpen.value = false
+      loadedAt.value = 0
+    } else {
+      ElMessage.error('保存失败，看弹窗里的输出')
+    }
+  } catch (err) {
+    netLog.value = cleanError(err)
+    ElMessage.error('保存失败')
+  } finally {
+    netBusy.value = false
+  }
+}
 </script>
 
 <template>
@@ -234,6 +485,50 @@ const showExtraNets = ref(false)
               </span>
             </div>
           </div>
+
+          <!-- 未挂载的磁盘：df 里根本不会出现，只能靠 lsblk 单独列 -->
+          <div class="unmounted">
+            <div class="um-head">
+              <span class="um-title">未挂载的磁盘</span>
+              <span class="badge">{{ unmounted.length }}</span>
+              <div class="grow" />
+              <el-button text size="small" :icon="Refresh" :loading="diskLoading" @click="loadDisks">
+                重新扫描
+              </el-button>
+            </div>
+
+            <div v-if="diskError" class="um-empty err">{{ diskError }}</div>
+            <div v-else-if="diskLoading && !unmounted.length" class="um-empty">正在扫描块设备…</div>
+            <div v-else-if="!unmounted.length" class="um-empty">
+              没有未挂载的分区（所有块设备都已挂到目录上）
+            </div>
+            <div v-else class="um-list">
+              <div v-for="d in unmounted" :key="d.path" class="um-row">
+                <span class="um-dev mono">{{ d.path }}</span>
+                <span class="um-size mono">{{ d.size }}</span>
+                <span class="um-fs mono" :class="{ plain: !d.fstype }">
+                  {{ d.isSwap ? 'swap' : d.fstype || '未格式化' }}
+                </span>
+                <span class="um-note truncate" :title="d.label || d.model">
+                  {{ d.label || d.model || (d.type === 'lvm' ? 'LVM 逻辑卷' : '—') }}
+                </span>
+                <span class="um-act">
+                  <span v-if="d.isSwap" class="um-tag">swap 不能挂目录</span>
+                  <span v-else-if="!d.fstype" class="um-tag">先格式化</span>
+                  <el-button
+                    v-else
+                    text
+                    size="small"
+                    type="primary"
+                    :icon="FolderAdd"
+                    @click="openMount(d)"
+                  >
+                    挂载
+                  </el-button>
+                </span>
+              </div>
+            </div>
+          </div>
         </section>
 
         <div class="stack">
@@ -245,6 +540,8 @@ const showExtraNets = ref(false)
                 <span class="ifname mono">{{ n.name }}</span>
                 <span class="chip" :class="n.up ? 'up' : 'down'">{{ n.up ? 'UP' : 'DOWN' }}</span>
                 <span v-if="n.mac" class="mac mono">{{ n.mac }}</span>
+                <div class="grow" />
+                <el-button text size="small" :icon="Setting" @click="openNet(n)">配置</el-button>
               </div>
               <div class="ips">
                 <span v-for="ip in n.ipv4" :key="ip" class="ip mono">{{ ip }}</span>
@@ -297,6 +594,98 @@ const showExtraNets = ref(false)
         </div>
       </template>
     </div>
+
+    <!-- 挂载磁盘 -->
+    <el-dialog v-model="mountOpen" title="挂载磁盘" width="520px" :close-on-click-modal="false">
+      <div class="dlg">
+        <div class="dlg-row">
+          <span class="dlg-k">设备</span>
+          <span class="dlg-v mono">{{ mountForm.device }}</span>
+          <span class="chip">{{ mountTarget?.size }}</span>
+          <span class="chip">{{ mountForm.fstype }}</span>
+        </div>
+
+        <div class="dlg-row">
+          <span class="dlg-k">挂载点</span>
+          <el-input v-model="mountForm.mountPoint" class="mono" placeholder="/data" />
+        </div>
+
+        <el-checkbox v-model="mountForm.persist" class="dlg-check">
+          写入 /etc/fstab，开机自动挂载
+        </el-checkbox>
+
+        <div class="dlg-tip">
+          挂载点不存在会自动建目录，用的是 <code>defaults,nofail</code>：盘不在也能开机。
+          挂之前会备份 /etc/fstab。目标目录里原有的文件不会删除，只是被这块盘暂时盖住。
+        </div>
+
+        <pre v-if="mountLog" class="dlg-log mono">{{ mountLog }}</pre>
+      </div>
+      <template #footer>
+        <el-button @click="mountOpen = false">取消</el-button>
+        <el-button type="primary" :loading="mountBusy" @click="doMount">挂载</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 配置网络 -->
+    <el-dialog v-model="netOpen" title="配置网络" width="520px" :close-on-click-modal="false">
+      <div v-loading="netLoading" class="dlg">
+        <div class="dlg-row">
+          <span class="dlg-k">网卡</span>
+          <span class="dlg-v mono">{{ netForm.device }}</span>
+          <span class="chip">{{ backendText }}</span>
+        </div>
+
+        <div class="dlg-row">
+          <span class="dlg-k">地址来源</span>
+          <el-radio-group v-model="netForm.method" size="small">
+            <el-radio-button value="manual">静态</el-radio-button>
+            <el-radio-button value="dhcp">DHCP</el-radio-button>
+          </el-radio-group>
+        </div>
+
+        <template v-if="netForm.method === 'manual'">
+          <div class="dlg-row">
+            <span class="dlg-k">IP 地址</span>
+            <el-input v-model="netForm.ip" class="mono" placeholder="172.30.10.206" />
+            <span class="dlg-slash mono">/</span>
+            <el-input v-model="netForm.prefix" class="mono dlg-prefix" placeholder="22" />
+          </div>
+          <div class="dlg-row">
+            <span class="dlg-k">网关</span>
+            <el-input v-model="netForm.gateway" class="mono" placeholder="172.30.10.1" />
+          </div>
+        </template>
+
+        <div class="dlg-row">
+          <span class="dlg-k">DNS</span>
+          <el-input v-model="netForm.dns" class="mono" placeholder="8.8.8.8, 1.1.1.1" />
+        </div>
+
+        <div v-if="netCfg?.hint" class="dlg-tip">{{ netCfg.hint }}</div>
+
+        <div class="dlg-warn">
+          <el-icon><WarningFilled /></el-icon>
+          <span>
+            保存后重启网络，连接会短暂中断；<b>改了 IP 的话这条 SSH 会直接断开</b>，
+            需要用新地址重新连接。
+          </span>
+        </div>
+
+        <pre v-if="netLog" class="dlg-log mono">{{ netLog }}</pre>
+      </div>
+      <template #footer>
+        <el-button @click="netOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="netBusy"
+          :disabled="netForm.backend === 'none'"
+          @click="doApplyNet"
+        >
+          保存并应用
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -778,5 +1167,169 @@ const showExtraNets = ref(false)
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ---------- 未挂载的磁盘 ---------- */
+.unmounted {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-soft);
+}
+
+.um-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+}
+
+.um-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.um-empty {
+  padding: 10px 2px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.um-empty.err {
+  color: var(--danger);
+  max-width: none;
+}
+
+.um-row {
+  display: grid;
+  /* 设备 / 容量 / 文件系统 三列定宽（都是短字符串），说明列吃掉剩下的空间 */
+  grid-template-columns: minmax(90px, 130px) 64px 78px minmax(0, 1fr) 92px;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 2px;
+  font-size: 12px;
+  border-bottom: 1px dashed color-mix(in srgb, var(--border-soft) 55%, transparent);
+}
+
+.um-row:last-child {
+  border-bottom: none;
+}
+
+.um-dev {
+  color: var(--text-1);
+}
+
+.um-size {
+  color: var(--text-2);
+}
+
+.um-fs {
+  color: var(--text-2);
+}
+
+.um-fs.plain {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+.um-note {
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.um-act {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.um-tag {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* ---------- 挂载 / 配网弹窗 ---------- */
+.dlg {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.dlg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dlg-k {
+  flex: none;
+  width: 62px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.dlg-v {
+  color: var(--text-1);
+}
+
+.dlg-slash {
+  color: var(--text-3);
+}
+
+.dlg-prefix {
+  width: 62px;
+  flex: none;
+}
+
+.dlg-check {
+  margin-top: -2px;
+}
+
+.dlg-tip {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-hover);
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.dlg-tip code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--text-1) 8%, transparent);
+  font-family: var(--font-mono);
+}
+
+.dlg-warn {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.dlg-warn .el-icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+.dlg-log {
+  margin: 0;
+  max-height: 170px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 6px;
+  background: #0b0f15;
+  color: #d5e2f0;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>

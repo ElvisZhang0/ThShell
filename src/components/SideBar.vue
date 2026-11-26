@@ -319,6 +319,16 @@ function activeOf(serverId: string): boolean {
   padding: 10px 10px 8px;
 }
 
+/* 搜索框吃掉剩下的宽度，"新建分组"不许被压扁 */
+.search-row :deep(.el-input) {
+  flex: 1;
+  min-width: 0;
+}
+
+.search-row :deep(.el-button) {
+  flex: none;
+}
+
 .tree {
   flex: 1;
   overflow-y: auto;

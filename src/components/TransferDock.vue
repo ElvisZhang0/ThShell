@@ -11,8 +11,9 @@
  * 为什么默认收起：它是个"看一眼就走"的辅助面板，常驻展开会一直占掉
  * 终端/文件列表的高度。收起时也不浪费：这一行本身就显示当前传输的百分比。
  */
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAppStore } from '../stores/app'
+import type { TransferRecord } from '../../electron/types'
 import { ArrowDown, Close, Download, Sort, Upload, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import {
   formatDuration,
@@ -58,7 +59,132 @@ const summary = computed(() => {
 
 const total = computed(() => store.transferLog.length)
 
+/**
+ * 一条历史记录的收尾。顺序必须和 transferState() 一致：出错 > 取消 > 完成。
+ *
+ * 之前这里只判断了 `error`，于是"手动取消"的记录（主进程写的是 canceled 而不是 error）
+ * 全被显示成绿色的「已完成」—— 用户明明点了取消，界面却说他传完了。
+ * 取消不是失败：不该计进"N 个失败"，也不该用红色。
+ */
+function recordState(rec: TransferRecord): '失败' | '已取消' | '已完成' {
+  if (rec.error) return '失败'
+  if (rec.canceled) return '已取消'
+  return '已完成'
+}
+
+/** 悬停文案。取消那一行要说清是"没传完就被停了"，否则跟完成看起来一样 */
+function recordTitle(rec: TransferRecord): string {
+  if (rec.error) return rec.error
+  const base = `${rec.from} → ${rec.to}\n耗时 ${formatDuration(rec.ms)}`
+  return rec.canceled ? `已取消（未传完）\n${base}` : base
+}
+
+/* ------------------------------------------------------------ 拖拽调高度 */
+
+/**
+ * 展开后列表的高度。标题栏整条就是拖拽手柄：往上拖变高，往下拖变矮，宽度不动。
+ *
+ * 原来写死 260px —— 传一整个目录时 120 条记录挤在 5 行里滚，想多看两行没处说理。
+ *
+ * 两种模式，区别很要紧：
+ *   没手动拖过 → max-height（内容多高就多高，上限 260）。记录只有一两条时
+ *                不撑出一块空白，和以前的观感一致。
+ *   手动拖过   → 固定 height。**这条是"拖不动"的根因**：以前只用 max-height，
+ *                记录少的时候内容本来就撑不满 260，往上拖把上限从 260 改成 400
+ *                界面上一点变化都没有，看着就像拖不动。
+ *                改成一拖之后锁成固定高度，拖多少就是多少，一定有反馈。
+ */
+const HEIGHT_KEY = 'thshell.transferDock.height'
+const DEFAULT_H = 260
+/** 最小高度：一条记录（两行文字 + 内边距）的高度，再矮就什么都看不全了 */
+const MIN_H = 56
+/** 拖动阈值：小于 3px 当点击，否则"手抖一下"就把面板收起来了 */
+const DRAG_SLOP = 3
+
+/** 本机存过的、用户亲手拖出来的高度；没存过说明他从没拖过 */
+const storedH = ((): number | null => {
+  const raw = localStorage.getItem(HEIGHT_KEY)
+  if (raw == null) return null
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= MIN_H ? Math.round(n) : null
+})()
+
+const height = ref(storedH ?? DEFAULT_H)
+/** 手动拖过没有 —— 决定用固定高度还是"内容自适应、260 封顶" */
+const manual = ref(storedH !== null)
+const resizing = ref(false)
+
+/** 拖完那一下浏览器会补一个 click，别让它把面板收起来 */
+let swallowClick = false
+let drag: { y: number; h: number; moved: boolean } | null = null
+
+/** 上限：至少给主区域（终端 / 文件列表）留 220px，不然拖满就把上面压没了 */
+function maxHeight(): number {
+  return Math.max(MIN_H, Math.min(window.innerHeight - 220, Math.round(window.innerHeight * 0.72)))
+}
+
+function onHeadDown(e: PointerEvent): void {
+  if (!open.value) return
+  // 「清空」按钮上按下鼠标是点按钮，不是拖面板
+  if ((e.target as HTMLElement).closest('button')) return
+  // 基准取"此刻真实渲染高度"而不是 height：内容自适应时后者是上限 260，
+  // 实际可能只有 200，用它当基准会让面板在开始拖的一瞬间跳一下
+  const real = listEl.value?.getBoundingClientRect().height ?? height.value
+  drag = { y: e.clientY, h: Math.round(real), moved: false }
+  window.addEventListener('pointermove', onDragMove)
+  window.addEventListener('pointerup', onDragUp)
+  // 手指被系统手势抢走、或窗口失焦时不会有 pointerup，收尾得挂在 cancel 上
+  window.addEventListener('pointercancel', onDragUp)
+}
+
+function onDragMove(e: PointerEvent): void {
+  if (!drag) return
+  // 面板在窗口底部：往上拖 clientY 变小，高度就得变大
+  const dy = drag.y - e.clientY
+  if (!drag.moved) {
+    if (Math.abs(dy) < DRAG_SLOP) return
+    drag.moved = true
+    resizing.value = true
+    // 一旦真开始拖，就从"内容自适应"切成"固定高度"，否则拖高看不出变化
+    manual.value = true
+  }
+  height.value = Math.min(maxHeight(), Math.max(MIN_H, Math.round(drag.h + dy)))
+}
+
+function onDragUp(): void {
+  window.removeEventListener('pointermove', onDragMove)
+  window.removeEventListener('pointerup', onDragUp)
+  window.removeEventListener('pointercancel', onDragUp)
+  const moved = drag?.moved ?? false
+  drag = null
+  if (!resizing.value) return
+  resizing.value = false
+  localStorage.setItem(HEIGHT_KEY, String(height.value))
+  if (moved) {
+    swallowClick = true
+    // click 紧跟 pointerup 触发，给 300ms 足够；超过就当没有 click 要来，别一直吞下去
+    setTimeout(() => (swallowClick = false), 300)
+  }
+}
+
+watch(resizing, (on) => {
+  // 拖动途中光标可能飘到终端上，那里是 text 光标 —— 全局压一下才不会看着像在选字
+  document.body.style.cursor = on ? 'ns-resize' : ''
+  document.body.style.userSelect = on ? 'none' : ''
+})
+
+/** 窗口变矮时把拖出来的高度收回来，否则列表会把主区域顶没 */
+function clampHeight(): void {
+  const max = maxHeight()
+  if (height.value > max) height.value = max
+}
+
+/** 点标题栏 = 展开 / 收起；刚拖完的那一次点击要放过去，不然拖拉完面板自己关了 */
 function toggle(): void {
+  if (swallowClick) {
+    swallowClick = false
+    return
+  }
   open.value = !open.value
 }
 
@@ -80,19 +206,31 @@ watch(
 )
 
 onMounted(() => {
+  clampHeight()
+  window.addEventListener('resize', clampHeight)
   void store.loadTransferLog()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', clampHeight)
+  window.removeEventListener('pointermove', onDragMove)
+  window.removeEventListener('pointerup', onDragUp)
+  window.removeEventListener('pointercancel', onDragUp)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
 })
 </script>
 
 <template>
-  <section class="dock" :class="{ open }">
-    <!-- 这一行始终在：收起时它就是"状态条"，展开时它是标题栏 -->
+  <section class="dock" :class="{ open, resizing }">
+    <!-- 这一行始终在：收起时它就是"状态条"，展开时它是标题栏 + 拖拽手柄 -->
     <div
       class="head"
       role="button"
       tabindex="0"
-      :title="open ? '收起传输记录' : '展开传输记录'"
+      :title="open ? '点一下收起 · 上下拖动可调整记录区高度' : '展开传输记录'"
       @click="toggle"
+      @pointerdown="onHeadDown"
       @keydown.enter.prevent="toggle"
       @keydown.space.prevent="toggle"
     >
@@ -126,7 +264,7 @@ onMounted(() => {
       <el-icon class="h-chev" :class="{ up: open }"><ArrowDown /></el-icon>
     </div>
 
-    <div v-if="open" ref="listEl" class="dock-list">
+    <div v-if="open" ref="listEl" class="dock-list" :class="{ manual }" :style="{ '--dock-h': height + 'px' }">
       <!-- 进行中：进度 + 源 → 目标 -->
       <div
         v-for="item in active"
@@ -173,7 +311,7 @@ onMounted(() => {
             <el-progress
               class="bar"
               :percentage="percentOf(item)"
-              :status="item.error ? 'exception' : item.done ? 'success' : undefined"
+              :status="item.error ? 'exception' : item.canceled ? 'warning' : item.done ? 'success' : undefined"
               :stroke-width="4"
               :show-text="false"
             />
@@ -196,8 +334,8 @@ onMounted(() => {
         v-for="rec in history"
         :key="rec.id"
         class="row done"
-        :class="{ failed: !!rec.error }"
-        :title="rec.error || `${rec.from} → ${rec.to}\n耗时 ${formatDuration(rec.ms)}`"
+        :class="{ failed: !!rec.error, canceled: !!rec.canceled && !rec.error }"
+        :title="recordTitle(rec)"
       >
         <span class="badge" :class="rec.direction">
           <el-icon>
@@ -212,8 +350,8 @@ onMounted(() => {
             <span v-if="rec.dir" class="tag">文件夹</span>
             <span class="m size mono">{{ formatSize(rec.size) }}</span>
             <span class="m when mono">{{ formatWhen(rec.at) }}</span>
-            <span class="m state" :class="{ bad: !!rec.error }">
-              {{ rec.error ? '失败' : '已完成' }}
+            <span class="m state" :class="{ bad: !!rec.error, off: !!rec.canceled && !rec.error }">
+              {{ recordState(rec) }}
             </span>
           </div>
           <div class="path mono">
@@ -253,6 +391,17 @@ onMounted(() => {
 
 .head:hover {
   background: var(--bg-hover);
+}
+
+/* 展开时这条就是拖拽手柄：上下拖改记录区高度。光标先说明这件事，
+   否则没人会想到"标题栏还能拖" */
+.dock.open .head {
+  cursor: ns-resize;
+}
+
+/* 正在拖：底色点亮，手在动的时候也要有反馈 */
+.dock.resizing .head {
+  background: var(--accent-soft);
 }
 
 .head:focus-visible {
@@ -342,14 +491,21 @@ onMounted(() => {
   transform: rotate(180deg);
 }
 
-/* 展开后给个上限：传了 20 个文件也不该把终端挤成一条缝。
- * 260px 是按"三条进行中 + 一条历史刚好不滚动"标定的（冒烟里有断言）；
- * 行内的控制按钮从 16px 放大到 22px 之后，每行高 6px，这里跟着加了 28px。 */
+/* 展开后的列表区。--dock-h 由 JS 写进行内样式。
+ *
+ * 没拖过时只是"上限"：记录少的时候高度跟着内容走，不撑空白。
+ * 拖过之后（.manual）锁成固定高度 —— 必须这样，否则记录只有两三条时
+ * 往上拖把上限从 260 改到 400，界面一动不动，用户只会觉得这功能坏了。 */
 .dock-list {
-  max-height: 260px;
+  max-height: var(--dock-h, 260px);
   overflow-y: auto;
   padding: 2px 12px 8px;
   border-top: 1px solid var(--border-soft);
+}
+
+.dock-list.manual {
+  height: var(--dock-h, 260px);
+  max-height: none;
 }
 
 .row {
@@ -391,6 +547,13 @@ onMounted(() => {
   background: color-mix(in srgb, var(--danger) 14%, transparent);
 }
 
+/* 用户自己取消的：灰掉但保留记录。
+   不给红色 —— 红色是"出了错"，取消是他自己的决定；也不给绿色，那等于说传完了 */
+.row.canceled .badge {
+  color: var(--text-3);
+  background: color-mix(in srgb, var(--text-1) 8%, transparent);
+}
+
 .body {
   flex: 1;
   min-width: 0;
@@ -419,6 +582,10 @@ onMounted(() => {
 
 .row.failed .name {
   color: var(--danger);
+}
+
+.row.canceled .name {
+  color: var(--text-3);
 }
 
 .tag {
@@ -482,6 +649,11 @@ onMounted(() => {
 
 .m.state.bad {
   color: var(--danger);
+}
+
+/* 「已取消」既不是成功色也不是失败色，走中性灰 */
+.m.state.off {
+  color: var(--text-3);
 }
 
 .bar {

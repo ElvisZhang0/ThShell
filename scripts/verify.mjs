@@ -25,18 +25,56 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+/**
+ * 单独一份 userData。
+ * 正式版开着的时候，冒烟进程会和它抢同一个单实例锁 → 静默退出、零输出，
+ * 看上去跟编译坏了没区别。这里给冒烟一份隔离目录，再把现有配置拷进去，
+ * 服务器列表照旧可用，锁互不打扰。
+ */
+const ISOLATED_DATA = (() => {
+  const dir = path.join(os.tmpdir(), 'thshell-smoke-userdata')
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    const appData = process.env.APPDATA || path.join(os.homedir(), '.config')
+    const srcDir = path.join(appData, 'thshell')
+    // Local State 里存着加密配置用的 key：只拷配置文件、不拷它的话，
+    // 密码会解成 undefined，冒烟全部卡在「认证失败」。
+    for (const file of ['thshell-config.json', 'Local State']) {
+      const src = path.join(srcDir, file)
+      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, file))
+    }
+  } catch {
+    /* 拷不了就算了：最多还是撞锁，不是必挂 */
+  }
+  return dir
+})()
 /** electron 包导出的就是可执行文件路径 */
 const electronPath = require('electron')
 
 /** 改完代码必须过一遍的几组：都自带数据准备，不依赖机器上有什么文件 */
 const CORE = ['bar', 'update', 'text', 'log', 'pdf', 'edit', 'tips', 'icons', 'perm', 'local']
 /** 布局 / 视觉类：只在动了对应区域时带上，跑得慢（每组 ~10s） */
-const LAYOUT = ['foot', 'menu', 'jump', 'transfer', 'clip', 'tabs', 'quick', 'monitor', 'sys']
+const LAYOUT = [
+  'foot',
+  'menu',
+  'jump',
+  'transfer',
+  'clip',
+  'tabs',
+  'quick',
+  'monitor',
+  'sys',
+  'procs',
+  'services'
+]
 const ALL = [...CORE, ...LAYOUT]
 
 const argv = process.argv.slice(2)
@@ -88,7 +126,11 @@ function runOne(mode) {
     // 有它在 Electron 会退化成纯 Node 进程，窗口都起不来
     delete env.ELECTRON_RUN_AS_NODE
 
-    const child = spawn(electronPath, ['.'], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(electronPath, ['.', `--user-data-dir=${ISOLATED_DATA}`], {
+      cwd: root,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
     let out = ''
 
     // 默认只实时吐失败行，其余的攒到最后汇总 —— 全过程刷屏反而看不见重点。

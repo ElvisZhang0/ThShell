@@ -8,7 +8,7 @@ import { ArrowDown, ArrowUp, Close, CopyDocument, Search } from '@element-plus/i
 import { ElMessage } from 'element-plus'
 import { useAppStore } from '../stores/app'
 import type { Tab } from '../stores/app'
-import { HOT_COMMANDS, QUICK_GROUPS, QUICK_TOTAL, type QuickCommand } from '../utils/quick-commands'
+import { HOT_COMMANDS, QUICK_GROUPS, QUICK_TOTAL, type QuickCommand, type QuickGroup } from '../utils/quick-commands'
 
 const props = defineProps<{ tab: Tab }>()
 const store = useAppStore()
@@ -37,6 +37,9 @@ const termHost = ref<HTMLDivElement>()
 const searchOpen = ref(false)
 const searchText = ref('')
 const panelOpen = ref(false)
+/** 命令面板里的搜索词：69 条命令靠翻是找不到的，先收窄再点 */
+const qpQuery = ref('')
+const qpInput = ref<HTMLInputElement>()
 const ctx = ref({ visible: false, x: 0, y: 0 })
 
 let term: Terminal | null = null
@@ -72,6 +75,24 @@ const darkTheme = {
   brightWhite: '#f1f5f9'
 }
 
+/**
+ * 浅色主题的 ANSI 调色板。
+ *
+ * ⚠️ 这里踩过一次：整套 bright* 以及 white 原本是按"深色底"配的浅色，
+ * 搬到白底上直接没法看 —— 而且最要命的是 white(37) 和 brightWhite(97)，
+ * 白底上对比度只有 1.2:1 和 1.05:1，等于隐形。
+ *
+ * 具体症状：PowerShell 的 PSReadLine 用 ANSI 画语法高亮，
+ * 敲 `cd D:` 时 `cd` 是 brightYellow(93)、`D:` 是 white(37)、
+ * 行内预测建议是 brightWhite(97) —— 三个全落在浅色区间里，
+ * 用户看到的就是"这几坨字怎么这么浅"。
+ *
+ * 修法不去动 PowerShell（$PSStyle / PSReadLine 的配色是用户自己的环境，
+ * 之前就因为覆盖过一次被要求还原），而是把浅色主题的调色板改对：
+ * 浅底上的 "bright" 不该更亮，该更深 —— 白底上"更醒目"就是"更黑"。
+ * 取值参照 VS Code Default Light+ 的思路（它的 ansiWhite 是 #555 而不是 #fff），
+ * 并保证对比度：正文色 ≥ 4.5:1、预测建议这种弱化文字 ≥ 3:1。
+ */
 const lightTheme = {
   background: '#ffffff',
   foreground: '#1f2937',
@@ -85,19 +106,33 @@ const lightTheme = {
   blue: '#2563eb',
   magenta: '#9333ea',
   cyan: '#0891b2',
-  white: '#e5e7eb',
+  // 37 号色：PSReadLine 用它画"裸参数"（cd D: 里的 D:），很多 CLI 也拿它当次要正文。
+  // 原来是 #e5e7eb（白底 1.24:1 ≈ 隐形），改成深灰后 7.0:1。
+  white: '#57606f',
   brightBlack: '#6b7280',
-  brightRed: '#ef4444',
-  brightGreen: '#10b981',
-  brightYellow: '#f59e0b',
-  brightBlue: '#3b82f6',
-  brightMagenta: '#a855f7',
-  brightCyan: '#06b6d4',
-  brightWhite: '#f9fafb'
+  brightRed: '#b91c1c',
+  brightGreen: '#047857',
+  // 93 号色：PSReadLine 画命令名，原来是 #f59e0b（2.2:1），现在是 5.4:1
+  brightYellow: '#a16207',
+  brightBlue: '#1d4ed8',
+  brightMagenta: '#7e22ce',
+  brightCyan: '#0e7490',
+  // 97 号色：行内预测建议（还会再叠一层 dim），原来是 #f9fafb（1.05:1），现在是 4.6:1
+  brightWhite: '#6f7885'
 }
 
 function currentTheme() {
   return store.config.settings.theme === 'light' ? lightTheme : darkTheme
+}
+
+/**
+ * 把当前配色挂到 window 上。
+ *
+ * 冒烟要算"白底上 ANSI 白到底看不看得见"（对比度），读的就是这份实时表；
+ * 排查"某个颜色怎么这么浅"时也能直接在控制台敲 __termTheme 看，不用翻源码。
+ */
+function publishTheme(): void {
+  ;(window as unknown as { __termTheme?: unknown }).__termTheme = currentTheme()
 }
 
 function doFit() {
@@ -144,16 +179,28 @@ function runQuick(item: QuickCommand) {
 
 function togglePanel() {
   panelOpen.value = !panelOpen.value
-  if (!panelOpen.value) term?.focus()
+  if (panelOpen.value) {
+    // 每次打开都从干净的全量列表开始；顺手把焦点放进搜索框 ——
+    // 打开这个面板，十次有九次是"我要找某条命令"
+    qpQuery.value = ''
+    void nextTick(() => qpInput.value?.focus())
+  } else {
+    term?.focus()
+  }
 }
 
 /** 面板开着时按 Esc 关掉。终端把按键都吞了，所以在 window 捕获阶段拦一层 */
 function onPanelKeydown(event: KeyboardEvent) {
-  if (event.key === 'Escape' && panelOpen.value) {
-    event.stopPropagation()
-    panelOpen.value = false
-    term?.focus()
+  if (event.key !== 'Escape' || !panelOpen.value) return
+  event.stopPropagation()
+  // 第一次 Esc 只清搜索词：搜错了想退回全量表，不该顺手把面板一起关掉
+  if (qpQuery.value) {
+    qpQuery.value = ''
+    qpInput.value?.focus()
+    return
   }
+  panelOpen.value = false
+  term?.focus()
 }
 
 /** 悬停气泡的补充行：参数怎么读 / 什么时候会误判 */
@@ -161,6 +208,83 @@ function tipLines(item: QuickCommand): string[] {
   const lines = item.note ? [item.note] : []
   if (item.mode === 'fill') lines.push('点击只插入命令行，改完参数再回车')
   return lines
+}
+
+/**
+ * 命令面板的过滤结果。
+ *
+ * 匹配范围就是"屏幕上看得见的东西"：cmd / desc / 分组名。
+ * 曾经把 note 也算进去，结果搜 docker 时冒出一条 `findmnt -T`（它的悬停说明里提到了
+ * /var/lib/docker），卡片上却一个 docker 都找不到 —— 用户只会觉得这过滤是乱来的。
+ * 规则简单点：搜到的词必须能在卡片或它所在的分组名上看见。
+ *
+ * 分组名参与匹配是为了能整组捞：搜「网络」要把 ss -tunlp 这些带出来，
+ * 而它们命令里根本没有"网络"两个字。
+ *
+ * 空格分隔的多个词按 AND 处理：搜「磁盘 排序」只留 `du -sh * | sort -h` 这种两条都占的。
+ */
+const qpGroups = computed<QuickGroup[]>(() => {
+  const terms = qpQuery.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  if (!terms.length) return QUICK_GROUPS
+  return QUICK_GROUPS.map((g) => {
+    // 分组名命中就把整组端上来，不再逐条筛 —— 否则"磁盘与文件"只露出两条，看着像丢命令
+    const label = g.label.toLowerCase()
+    const byGroup = terms.every((t) => label.includes(t))
+    return {
+      label: g.label,
+      commands: byGroup
+        ? g.commands
+        : g.commands.filter((c) => {
+            const hay = `${c.cmd} ${c.desc}`.toLowerCase()
+            return terms.every((t) => hay.includes(t))
+          })
+    }
+  }).filter((g) => g.commands.length > 0)
+})
+
+const qpCount = computed(() => qpGroups.value.reduce((n, g) => n + g.commands.length, 0))
+
+/**
+ * 把命中搜索词的那几段切出来，好让 <mark> 上色。
+ * 没有搜索词时整段返回，模板里就不用再写一层 v-if —— 两种情况下结构完全一样。
+ */
+function markParts(text: string): { t: string; hit: boolean }[] {
+  const terms = qpQuery.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  if (!terms.length) return [{ t: text, hit: false }]
+  const low = text.toLowerCase()
+  const ranges: [number, number][] = []
+  for (const term of terms) {
+    let at = 0
+    for (;;) {
+      const i = low.indexOf(term, at)
+      if (i < 0) break
+      ranges.push([i, i + term.length])
+      at = i + term.length
+    }
+  }
+  if (!ranges.length) return [{ t: text, hit: false }]
+  // 排序后并集：「磁盘」和「磁盘管理」同时命中时不能切成互相重叠的几截
+  ranges.sort((a, b) => a[0] - b[0])
+  const merged: [number, number][] = []
+  for (const r of ranges) {
+    const last = merged[merged.length - 1]
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1])
+    else merged.push([r[0], r[1]])
+  }
+  const out: { t: string; hit: boolean }[] = []
+  let at = 0
+  for (const [s, e] of merged) {
+    if (s > at) out.push({ t: text.slice(at, s), hit: false })
+    out.push({ t: text.slice(s, e), hit: true })
+    at = e
+  }
+  if (at < text.length) out.push({ t: text.slice(at), hit: false })
+  return out
+}
+
+function clearQpSearch(): void {
+  qpQuery.value = ''
+  qpInput.value?.focus()
 }
 
 function clearTerminal() {
@@ -294,6 +418,7 @@ function initTerminal() {
 
 onMounted(() => {
   initTerminal()
+  publishTheme()
   window.addEventListener('click', closeCtx)
   // 捕获阶段：xterm 的 textarea 会把按键都吃掉，冒泡阶段拦不到 Esc
   window.addEventListener('keydown', onPanelKeydown, true)
@@ -337,6 +462,7 @@ watch(
 watch(
   () => store.config.settings.theme,
   () => {
+    publishTheme()
     if (!term) return
     term.options.theme = currentTheme()
   }
@@ -414,10 +540,35 @@ watch(
     <div v-show="panelOpen && !isLocal" class="quick-panel">
       <div class="qp-head">
         <span class="qp-title">运维常用命令</span>
-        <span class="qp-hint">共 {{ QUICK_TOTAL }} 条 · 点一下执行，悬停看说明</span>
+
+        <!-- 搜索框常驻在标题栏：命令列表只会越来越长，
+             滚着找不如先收窄。打开面板时焦点自动落在这里，可以直接敲字 -->
+        <div class="qp-search">
+          <el-icon class="qs-icon"><Search /></el-icon>
+          <input
+            ref="qpInput"
+            v-model="qpQuery"
+            class="qs-input"
+            type="text"
+            spellcheck="false"
+            placeholder="搜索命令或说明，如 端口 / 磁盘 / docker"
+          />
+          <button
+            v-if="qpQuery"
+            class="qs-clear"
+            title="清空搜索（Esc）"
+            @click.stop="clearQpSearch"
+          >
+            <el-icon><Close /></el-icon>
+          </button>
+        </div>
+
+        <span class="qp-hint">
+          {{ qpQuery ? `找到 ${qpCount} 条` : `共 ${QUICK_TOTAL} 条 · 点一下执行，悬停看说明` }}
+        </span>
       </div>
       <div class="qp-body">
-        <div v-for="group in QUICK_GROUPS" :key="group.label" class="qp-group">
+        <div v-for="group in qpGroups" :key="group.label" class="qp-group">
           <div class="qp-glabel">{{ group.label }}</div>
           <div class="qp-items">
             <el-tooltip
@@ -438,13 +589,29 @@ watch(
                 <!-- 命令文本单独一层负责截断。✎ 是一整条超长命令（curl、tcpdump）上唯一能看出
                      「点它只插入、不执行」的线索，不能跟着省略号一起被裁掉。 -->
                 <span class="qp-cmd mono">
-                  <span class="qp-cmd-t">{{ item.cmd }}</span>
+                  <span class="qp-cmd-t">
+                    <template v-for="(p, i) in markParts(item.cmd)" :key="i"
+                      ><mark v-if="p.hit" class="qp-hit">{{ p.t }}</mark
+                      ><template v-else>{{ p.t }}</template></template
+                    >
+                  </span>
                   <span v-if="item.mode === 'fill'" class="qp-edit">✎</span>
                 </span>
-                <span class="qp-desc">{{ item.desc }}</span>
+                <span class="qp-desc">
+                  <template v-for="(p, i) in markParts(item.desc)" :key="i"
+                    ><mark v-if="p.hit" class="qp-hit">{{ p.t }}</mark
+                    ><template v-else>{{ p.t }}</template></template
+                  >
+                </span>
               </button>
             </el-tooltip>
           </div>
+        </div>
+
+        <!-- 搜不到时不能只剩一片空白 —— 得说清"是没匹配，不是没命令"，并给一条退路 -->
+        <div v-if="!qpGroups.length" class="qp-empty">
+          <span>没有匹配「{{ qpQuery }}」的命令</span>
+          <button class="qp-empty-btn" @click.stop="clearQpSearch">看全部 {{ QUICK_TOTAL }} 条</button>
         </div>
       </div>
     </div>
@@ -662,7 +829,7 @@ watch(
 .qp-head {
   flex: none;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 8px 12px;
@@ -670,13 +837,115 @@ watch(
 }
 
 .qp-title {
+  flex: none;
   font-size: 12px;
   color: var(--text-1);
 }
 
+/* 搜索框夹在标题和计数之间，靠右但不贴边：
+   margin-left:auto 把"剩下的空间"全给它左侧，宽度不给死，窄窗口时才不会被计数文案挤扁 */
+.qp-search {
+  margin-left: auto;
+  flex: 0 1 340px;
+  min-width: 150px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-base);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.qp-search:focus-within {
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.qs-icon {
+  flex: none;
+  font-size: var(--icon-xs);
+  color: var(--text-3);
+}
+
+.qs-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 11.5px;
+  color: var(--text-1);
+}
+
+.qs-input::placeholder {
+  color: var(--text-3);
+}
+
+/* 清空按钮做成 14px 的小叉：不占地方，也不至于小到点不着 */
+.qs-clear {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.qs-clear:hover {
+  background: var(--bg-hover);
+  color: var(--text-1);
+}
+
 .qp-hint {
+  flex: none;
   font-size: 11px;
   color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* 命中片段：底色比 hover 用的 --accent-soft(13%) 再重一档 ——
+   11.5px 的等宽字上，13% 的底几乎看不出来，等于没标 */
+.qp-hit {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--accent);
+  border-radius: 2px;
+}
+
+.qp-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 36px 0 32px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.qp-empty-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-base);
+  font-size: 11px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.qp-empty-btn:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .qp-body {

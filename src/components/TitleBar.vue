@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowDown, Expand, Fold, Monitor, Plus, Setting, Upload } from '@element-plus/icons-vue'
+import { Expand, Fold, InfoFilled, Monitor, Plus, Setting, Upload } from '@element-plus/icons-vue'
 import { computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAppStore, cleanError } from '../stores/app'
@@ -23,10 +23,9 @@ const store = useAppStore()
 /** 启动时的静默检查查到了新版本 → 「关于」按钮上点一个小圆点 */
 const hasUpdate = computed(() => !!updateState.result?.hasUpdate)
 
-/** 「关于」下拉的四项：关于 / 配置 / 检查更新 / 使用说明 */
+/** 「关于」下拉的三项：关于 / 检查更新 / 使用说明。设置（配置）有独立的齿轮按钮，不再重复放一份 */
 function onMenu(command: string | number | object): void {
   if (command === 'about') emit('open-about')
-  else if (command === 'settings') emit('open-settings')
   else if (command === 'update') emit('open-update')
   else if (command === 'help') emit('open-help')
 }
@@ -77,37 +76,20 @@ async function importConfig() {
       </div>
     </div>
 
-    <!-- 菜单栏：跟右侧那排操作按钮分开摆 —— 左边是"看/设置"，右边是"做事" -->
+    <!--
+      侧边栏开关就固定在品牌右边：展开时是「收起」，收起时是「展开」。
+      只给图标不带文字 —— 标题栏左侧本来就空，一串汉字横在那儿太抢，文案全交给 title。
+      放回标题栏而不是塞进侧边栏，是因为它得一直看得见：塞进侧边栏里的话，
+      侧边栏一收起，按钮就跟着一起没了。
+    -->
     <nav class="menubar">
       <button
         class="mb"
-        :class="{ on: !props.collapsed }"
         :title="props.collapsed ? '展开侧边栏（Ctrl+B）' : '收起侧边栏（Ctrl+B）'"
         @click="emit('toggle-sidebar')"
       >
-        <el-icon class="mb-ico"><component :is="props.collapsed ? Expand : Fold" /></el-icon>
-        <span>{{ props.collapsed ? '展开侧边栏' : '收起侧边栏' }}</span>
+        <el-icon><component :is="props.collapsed ? Expand : Fold" /></el-icon>
       </button>
-
-      <el-dropdown trigger="click" popper-class="tb-dropdown" @command="onMenu">
-        <button class="mb" :title="hasUpdate ? '有新版本可用' : '关于 / 配置 / 检查更新 / 使用说明'">
-          <span>关于</span>
-          <!-- 有新版本时只点一个点，不弹窗打扰 —— 什么时候装是用户说了算 -->
-          <span v-if="hasUpdate" class="mb-dot" />
-          <el-icon class="mb-caret"><ArrowDown /></el-icon>
-        </button>
-        <template #dropdown>
-          <el-dropdown-menu>
-            <el-dropdown-item command="about">关于 ThShell</el-dropdown-item>
-            <el-dropdown-item command="settings">配置</el-dropdown-item>
-            <el-dropdown-item command="update">
-              检查更新
-              <span v-if="hasUpdate" class="dot" />
-            </el-dropdown-item>
-            <el-dropdown-item command="help">使用说明</el-dropdown-item>
-          </el-dropdown-menu>
-        </template>
-      </el-dropdown>
     </nav>
 
     <div class="spacer" />
@@ -127,7 +109,31 @@ async function importConfig() {
         新建连接
       </el-button>
       <el-button size="small" :icon="Upload" @click="importConfig">导入</el-button>
-      <el-button size="small" :icon="Setting" circle @click="emit('open-settings')" />
+      <el-button size="small" :icon="Setting" circle title="设置" @click="emit('open-settings')" />
+
+      <!-- 关于紧跟在设置后面：都是"这个应用本身"的入口，摆一起才好找 -->
+      <div class="about-wrap">
+        <el-dropdown trigger="click" popper-class="tb-dropdown" @command="onMenu">
+          <el-button
+            size="small"
+            :icon="InfoFilled"
+            circle
+            :title="hasUpdate ? '有新版本可用 · 关于 / 检查更新 / 使用说明' : '关于 / 检查更新 / 使用说明'"
+          />
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="about">关于 ThShell</el-dropdown-item>
+              <el-dropdown-item command="update">
+                检查更新
+                <span v-if="hasUpdate" class="dot" />
+              </el-dropdown-item>
+              <el-dropdown-item command="help">使用说明</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <!-- 发版提示：不弹窗，只在图标右上角点一个点 -->
+        <span v-if="hasUpdate" class="about-dot" />
+      </div>
     </div>
   </header>
 </template>
@@ -195,9 +201,10 @@ async function importConfig() {
 .mb {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
   height: 26px;
-  padding: 0 9px;
+  padding: 0 6px;
   border: none;
   border-radius: 4px;
   background: transparent;
@@ -212,38 +219,32 @@ async function importConfig() {
   color: var(--text-1);
 }
 
-/* 侧边栏收起时这颗按钮变成"展开"，给一层极淡的高亮提示状态，
-   否则用户看不出它是个开关 */
-.mb.on {
-  color: var(--text-2);
+/* "有新版本"提示点：7px 的小圆点，不抢眼但能让人想起来点它。
+   画在图标按钮右上角，用标题栏底色描一圈边，看着像是从按钮里冒出来的 */
+.about-wrap {
+  position: relative;
+  display: flex;
 }
 
-.mb-ico {
-  font-size: 14px;
-}
-
-.mb-caret {
-  font-size: 10px;
-  color: var(--text-3);
-}
-
-/* "有新版本"提示点：6px 的小圆点，不抢眼但能让人想起来点它 */
-.mb-dot {
-  width: 6px;
-  height: 6px;
-  margin-left: -1px;
+.about-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-soft);
+  box-shadow: 0 0 0 2px var(--titlebar-bg);
+  pointer-events: none;
 }
 
 /* el-dropdown 默认是 inline-flex，按钮会被它撑出额外的高度 */
-.menubar :deep(.el-dropdown) {
+.actions :deep(.el-dropdown) {
   display: flex;
 }
 
 /* EP 会给触发元素的焦点加蓝色描边，标题栏里太扎眼 */
-.menubar :deep(.el-dropdown > .mb:focus) {
+.actions :deep(.el-dropdown > .el-button:focus) {
   outline: none;
 }
 
@@ -261,5 +262,19 @@ async function importConfig() {
 
 .actions :deep(.el-button .el-icon) {
   font-size: var(--icon-md);
+}
+
+/* 圆形图标按钮不要那圈描边：标题栏自己就有底色，再套一圈圆框像是浮在上面的卡片，
+   和左边带文字的按钮也不在一个语言里。hover 才给一点底色，说明它可点。 */
+.actions :deep(.el-button.is-circle) {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+}
+
+.actions :deep(.el-button.is-circle:hover) {
+  border-color: transparent;
+  background: var(--bg-hover);
+  color: var(--text-1);
 }
 </style>

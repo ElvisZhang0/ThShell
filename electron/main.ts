@@ -1,4 +1,15 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeTheme, shell } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  desktopCapturer,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeTheme,
+  shell
+} from 'electron'
+import type { MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -6,7 +17,17 @@ import { ConfigStore } from './modules/config-store'
 import { SshManager } from './modules/ssh-manager'
 import { LocalShellManager } from './modules/local-shell'
 import { clearMetricsState, collectMetrics } from './modules/metrics'
+import { clearProcState, collectProcesses, killProcess } from './modules/procs'
+import {
+  clearServiceState,
+  collectServices,
+  dropSeen,
+  parseJournal,
+  serviceAction,
+  serviceLogs
+} from './modules/services'
 import { collectSystemInfo } from './modules/sysinfo'
+import { applyNetConfig, listUnmountedDisks, mountDisk, readNetConfig } from './modules/syscfg'
 import {
   dockerCompose,
   dockerContainerAction,
@@ -73,7 +94,18 @@ import {
   writeLocalFile
 } from './modules/local-fs'
 import { DEFAULT_UPDATE_FEEDS } from './types'
-import type { AppInfo, FileEntry, PasteMode, ServerConfig, TransferProgress, UpdateAsset } from './types'
+import type {
+  AppInfo,
+  FileEntry,
+  MountRequest,
+  NetConfigApply,
+  PasteMode,
+  ServerConfig,
+  ServiceAction,
+  ServiceLogQuery,
+  TransferProgress,
+  UpdateAsset
+} from './types'
 import type { TextEncoding } from './modules/text-guard'
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
@@ -82,6 +114,8 @@ const store = new ConfigStore()
 let mainWindow: BrowserWindow | null = null
 /** 最近一次 sftp:list 的会话 id，仅冒烟模式使假进度用 */
 let lastSessionId = ''
+/** 最近弹出的右键菜单：冒烟核对弹了哪些项，也用来强行关掉 */
+let lastContextMenu: Menu | null = null
 
 /** preload 事件统一从这里出，窗口销毁后 send 会抛，用 safeSend 兜一层 */
 function safeSend(channel: string, payload: unknown): void {
@@ -137,6 +171,45 @@ function setupAppMenu(): void {
   Menu.setApplicationMenu(null)
 }
 
+/**
+ * 右键菜单模板。
+ *
+ * 应用菜单被摘掉了（见 setupAppMenu），`pre` 里选中的日志没有系统菜单可点，
+ * 右键只能弹个空白 —— 所以自己拼一份。刻意只放剪贴板动作：里面既没有
+ * 「重新加载」也没有「检查元素」，点错位置不会把界面刷掉。
+ *
+ * 返回 null 表示这个位置不该弹菜单（没选区、也不是输入框），
+ * 界面上其它地方保持"右键没反应"的原样。
+ */
+function contextMenuTemplate(params: {
+  selectionText?: string
+  isEditable?: boolean
+  editFlags?: { canPaste?: boolean; canCopy?: boolean; canCut?: boolean }
+}): MenuItemConstructorOptions[] | null {
+  const sel = (params.selectionText || '').trim()
+
+  if (params.isEditable) {
+    return [
+      { label: '剪切', role: 'cut', enabled: params.editFlags?.canCut !== false && !!sel },
+      { label: '复制', role: 'copy', enabled: params.editFlags?.canCopy !== false && !!sel },
+      { label: '粘贴', role: 'paste', enabled: params.editFlags?.canPaste !== false },
+      { type: 'separator' },
+      { label: '全选', role: 'selectAll' }
+    ]
+  }
+
+  if (!sel) return null
+
+  // 选区信息放进标题：日志里拖了半天，能一眼确认到底选了多少、选对没
+  const lines = sel.split('\n').length
+  return [
+    {
+      label: lines > 1 ? `复制选中的 ${lines} 行` : `复制选中的 ${sel.length} 个字符`,
+      role: 'copy'
+    }
+  ]
+}
+
 function createWindow(): void {
   // 打包后 __dirname 在 app.asar 内，Electron 的 fs 补丁能直接读 asar 里的 png
   const iconPath = path.join(__dirname, '../resources/icon.png')
@@ -174,6 +247,17 @@ function createWindow(): void {
     if (!isF12 && !isCtrlShiftI) return
     mainWindow?.webContents.toggleDevTools()
     event.preventDefault()
+  })
+
+  /**
+   * 右键菜单：日志区能拖选，但应用菜单被摘掉之后选区没有可点的复制项。
+   * 冒烟要核对"到底弹了什么"，所以留一个引用（也方便弹卡住时强行关掉）。
+   */
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const template = contextMenuTemplate(params)
+    if (!template) return
+    lastContextMenu = Menu.buildFromTemplate(template)
+    lastContextMenu.popup({ window: mainWindow! })
   })
 
   // 页面加载失败时也要把窗口亮出来。show:false 配 ready-to-show 的写法有个坑：
@@ -249,6 +333,9 @@ function createWindow(): void {
           try {
             mainWindow!.show()
             mainWindow!.moveTop()
+            // 失焦窗口里 Chromium 会把选区画成"非活动态"（几乎看不见），
+            // 截"选中复制"这种图时不聚焦等于白截
+            mainWindow!.focus()
             // moveTop 之后要等合成器真的画一帧；不等的话拿到的是"上移之前"的那张
             await new Promise((r) => setTimeout(r, 250))
           } catch {
@@ -425,6 +512,29 @@ function createWindow(): void {
        * 没装 docker 的机器上这个页签不该出现，这里也顺便验证一下。
        */
       if (mode === 'docker') {
+        // 先做不依赖真机的命令构造断言：日志的两种取法（全量 tail / 增量 since）
+        const logCmds: string[] = []
+        const fakeExec = async (cmd: string) => {
+          logCmds.push(cmd)
+          return { code: 0, stdout: '', stderr: '' }
+        }
+        await dockerContainerLogs(fakeExec, 'abcdef123456', 300, '')
+        await dockerContainerLogs(fakeExec, 'abcdef123456', 300, '2026-11-23T07:27:53.123456789Z')
+        // since 必须走白名单：非时间戳一律退化成 tail，绝不能把内容拼进命令
+        await dockerContainerLogs(fakeExec, 'abcdef123456', 300, '1; rm -rf /')
+        const cmdTail = logCmds[0] || ''
+        const cmdSince = logCmds[1] || ''
+        const cmdBad = logCmds[2] || ''
+        console.log(
+          `[smoke] ${cmdTail.includes('--tail 300') && !cmdTail.includes('--since') ? 'PASS' : 'FAIL'} 首屏日志按行数取 ${cmdTail}`
+        )
+        console.log(
+          `[smoke] ${cmdSince.includes('--since') && cmdSince.includes('2026-11-23T07:27:53.123456789Z') && !cmdSince.includes('--tail') ? 'PASS' : 'FAIL'} 增量日志按时间戳取 ${cmdSince}`
+        )
+        console.log(
+          `[smoke] ${cmdBad.includes('--tail 300') && !cmdBad.includes('rm -rf') ? 'PASS' : 'FAIL'} 非法 since 退回 tail 且不拼进命令 ${cmdBad}`
+        )
+
         await wait(1500)
         await js(
           `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
@@ -534,6 +644,220 @@ function createWindow(): void {
           `(document.querySelector('.log-body')?.textContent || '').trim().length`
         )) as number
         console.log(`[smoke] ${logLen > 20 ? 'PASS' : 'FAIL'} 日志长度=${logLen}`)
+
+        // 实时跟随默认是开的，工具条上要有呼吸绿点 + 说明，用户才知道"它自己在刷"
+        const liveUI = (await js(`(() => {
+          const box = document.querySelector('.log-dialog')
+          const cb = [...(box?.querySelectorAll('.el-checkbox') || [])].find((el) => el.textContent.includes('实时'))
+          return {
+            checked: !!cb && cb.classList.contains('is-checked'),
+            dot: !!box?.querySelector('.live-dot'),
+            hint: !!box?.querySelector('.log-hint')
+          }
+        })()`)) as { checked: boolean; dot: boolean; hint: boolean }
+        console.log(
+          `[smoke] ${liveUI.checked && liveUI.dot && liveUI.hint ? 'PASS' : 'FAIL'} 日志默认开着实时跟随 ${JSON.stringify(liveUI)}`
+        )
+
+        /**
+         * 工具条在 1082 宽的窗口里原本会折成两行（四档行数 + 实时 + 说明 + 两颗按钮）。
+         * 元素高度不同，`align-items: center` 下 top 天然有差，所以比中心线。
+         */
+        const [lw, lh] = mainWindow!.getContentSize()
+        mainWindow!.setContentSize(1082, 647)
+        await wait(600)
+        const tools = (await js(`(() => {
+          const row = document.querySelector('.log-tools')
+          if (!row) return null
+          const mid = (el) => {
+            const r = el.getBoundingClientRect()
+            return r.height > 4 ? Math.round(r.top + r.height / 2) : null
+          }
+          const centers = [...row.children].map(mid).filter((v) => v !== null)
+          const radios = [...row.querySelectorAll('.el-radio-button')].map(mid).filter((v) => v !== null)
+          const hint = row.querySelector('.log-hint')
+          return {
+            centers,
+            radios,
+            hintHidden: !hint || getComputedStyle(hint).display === 'none'
+          }
+        })()`)) as { centers: number[]; radios: number[]; hintHidden: boolean } | null
+        const sameRow = (arr?: number[]) =>
+          !!arr && arr.length > 1 && Math.max(...arr) - Math.min(...arr) <= 3
+        console.log(
+          `[smoke] ${sameRow(tools?.centers) && sameRow(tools?.radios) ? 'PASS' : 'FAIL'} 窄窗口日志工具条不换行 ${JSON.stringify(tools)}`
+        )
+        await shot('docker-log-narrow.png')
+        mainWindow!.setContentSize(lw, lh)
+        await wait(400)
+
+        /**
+         * 真增量验证：不点刷新，往容器 pid1 的 stdout 写一行，看 1.5s 轮询能不能自己捞回来。
+         * docker logs 读的就是 pid1 的 stdout；有的镜像 /proc 是只读的，写不进去就 SKIP，
+         * 不能因为环境不支持判失败。但一旦写进去了却没捞到，那是真 bug，必须 FAIL。
+         */
+        const liveSid = (await js(
+          `((window.__store?.tabs || []).map((t) => t.sessionId).find(Boolean)) || ''`
+        )) as string
+        const liveRef = (await js(
+          `document.querySelector('.dk .row .sid')?.textContent?.trim() || ''`
+        )) as string
+        const mark = `THSHELL_LIVE_${Date.now()}`
+        const inj = liveSid && liveRef
+          ? await ssh.exec(
+              liveSid,
+              `docker exec ${liveRef} sh -c 'echo ${mark} > /proc/1/fd/1' 2>&1; echo "rc=$?"`
+            )
+          : null
+        if (!inj || !inj.stdout.includes('rc=0')) {
+          console.log(
+            `[smoke] SKIP 实时跟随未验证：容器 pid1 stdout 不可写 ${JSON.stringify(
+              (inj?.stdout || '').slice(0, 120)
+            )}`
+          )
+        } else {
+          await wait(2600)
+          const liveHit = (await js(
+            `(document.querySelector('.log-body')?.textContent || '').includes(${JSON.stringify(mark)})`
+          )) as boolean
+          console.log(`[smoke] ${liveHit ? 'PASS' : 'FAIL'} 实时跟随自己捞到了新写入的日志行`)
+        }
+
+        /**
+         * 增量刷新的价值就在这儿：用户往上翻看历史时不能被新日志拽走，
+         * 所以上翻要浮出「跳到最新」，点一下再回到底部继续跟随。
+         */
+        await js(`(() => { const el = document.querySelector('.log-body'); if (el) el.scrollTop = 0 })()`)
+        await wait(300)
+        const jumpShown = (await js(`!!document.querySelector('.log-jump')`)) as boolean
+        await shot('docker-log-jump.png')
+        await js(`document.querySelector('.log-jump')?.click()`)
+        await wait(300)
+        const jumpedBack = (await js(`(() => {
+          const el = document.querySelector('.log-body')
+          return !!el && el.scrollHeight - el.scrollTop - el.clientHeight < 24
+        })()`)) as boolean
+        console.log(`[smoke] ${jumpShown && jumpedBack ? 'PASS' : 'FAIL'} 上翻浮出「跳到最新」且点击回到底部`)
+
+        /**
+         * 选中复制。三道坎：
+         * 1. body 上是 user-select: none（界面文字本来不该被拖选），日志区得单独放开；
+         * 2. 实时刷新每 1.5s 整段重写 pre 的 textContent，选区一更新就没了 —— 有选区必须冻结；
+         * 3. Windows/Linux 摘掉了应用菜单，不能指望系统默认的 Ctrl+C，得自己写进剪贴板。
+         */
+        const pick = (await js(`(() => {
+          const el = document.querySelector('.log-body')
+          const sel = window.getSelection()
+          if (!el || !sel) return null
+          const node = el.firstChild
+          if (!node || node.nodeType !== 3) return null
+          sel.setBaseAndExtent(node, 0, node, Math.min(160, node.textContent.length))
+          return {
+            selectable: getComputedStyle(el).userSelect === 'text',
+            picked: sel.toString().trim().length
+          }
+        })()`)) as { selectable: boolean; picked: number } | null
+        await wait(200)
+        console.log(
+          `[smoke] ${pick?.selectable && (pick?.picked ?? 0) > 40 ? 'PASS' : 'FAIL'} 日志正文能拖选 ${JSON.stringify(pick)}`
+        )
+
+        // 同一个容器再写一行：冻结期间不该出现在界面上，松手后必须补上
+        const mark2 = `THSHELL_SEL_${Date.now()}`
+        const inj2 =
+          liveSid && liveRef
+            ? await ssh.exec(
+                liveSid,
+                `docker exec ${liveRef} sh -c 'echo ${mark2} > /proc/1/fd/1' 2>&1; echo "rc=$?"`
+              )
+            : null
+        const inj2ok = !!inj2?.stdout.includes('rc=0')
+
+        if (inj2ok) {
+          await wait(2400)
+          const frozen = (await js(`(() => {
+            const el = document.querySelector('.log-body')
+            return {
+              has: (el?.textContent || '').includes(${JSON.stringify(mark2)}),
+              hold: !!document.querySelector('.live-dot.hold'),
+              hint: (document.querySelector('.log-hint')?.textContent || '').trim()
+            }
+          })()`)) as { has: boolean; hold: boolean; hint: string }
+          console.log(
+            `[smoke] ${!frozen.has && frozen.hold && frozen.hint.includes('已暂停') ? 'PASS' : 'FAIL'} 选中期间冻结刷新并提示已暂停 ${JSON.stringify(frozen)}`
+          )
+          await shot('docker-log-select.png')
+        }
+
+        // Ctrl+C 自己接管：先塞个哨兵，免得读到上一轮的残留
+        const selText = (await js(`window.getSelection().toString()`)) as string
+        clipboard.writeText('__THSHELL_BEFORE__')
+        await js(
+          `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true }))`
+        )
+        await wait(400)
+        const clipSel = clipboard.readText()
+        const selHead = selText.trim().slice(0, 24)
+        console.log(
+          `[smoke] ${selHead && clipSel.includes(selHead) ? 'PASS' : 'FAIL'} Ctrl+C 把选中日志写进剪贴板（${clipSel.length} 字符）`
+        )
+
+        // 右键菜单：模板三条（有选区 / 空白 / 输入框），再真按一次右键看菜单是不是真弹了
+        const tplSel = contextMenuTemplate({ selectionText: 'aaa\nbbb\nccc' })
+        const tplBlank = contextMenuTemplate({ selectionText: '   ' })
+        const tplInput = contextMenuTemplate({ isEditable: true, selectionText: '' })
+        console.log(
+          `[smoke] ${tplSel?.length === 1 && tplSel[0].role === 'copy' && tplSel[0].label === '复制选中的 3 行' ? 'PASS' : 'FAIL'} 右键菜单：选区给复制项 ${JSON.stringify(tplSel?.map((i) => i.label))}`
+        )
+        console.log(
+          `[smoke] ${tplBlank === null ? 'PASS' : 'FAIL'} 右键菜单：空白处不弹`
+        )
+        console.log(
+          `[smoke] ${tplInput?.some((i) => i.role === 'paste') ? 'PASS' : 'FAIL'} 右键菜单：输入框带粘贴`
+        )
+
+        /**
+         * 接线：模板对了不代表挂上了。
+         * 注意别指望 sendInputEvent 造一次右键 —— 合成事件不进 Chromium 的
+         * context-menu 请求那条路（试过，永远不触发），只能查监听器 + 走一遍 popup。
+         */
+        const listeners = mainWindow!.webContents.listenerCount('context-menu')
+        console.log(`[smoke] ${listeners > 0 ? 'PASS' : 'FAIL'} 右键菜单已接管（监听器 ${listeners} 个）`)
+        const popTpl = contextMenuTemplate({ selectionText: 'x\ny' })
+        let popOk = false
+        try {
+          lastContextMenu = Menu.buildFromTemplate(popTpl!)
+          lastContextMenu.popup({ window: mainWindow! })
+          await wait(250)
+          popOk = lastContextMenu.items.length === 1 && lastContextMenu.items[0].role === 'copy'
+          lastContextMenu.closePopup()
+          await wait(200)
+        } catch (err) {
+          console.log(`[smoke] 右键菜单 popup 抛错 ${err}`)
+        }
+        console.log(`[smoke] ${popOk ? 'PASS' : 'FAIL'} 右键菜单能真的弹出来（build + popup + 关闭）`)
+
+        // 松手（清空选区）→ 冻结解除，落下的那行必须补回来
+
+        // 松手（清空选区）→ 冻结解除，落下的那行必须补回来
+        await js(`window.getSelection()?.removeAllRanges()`)
+        await wait(2400)
+        if (inj2ok) {
+          const thawed = (await js(
+            `(document.querySelector('.log-body')?.textContent || '').includes(${JSON.stringify(mark2)})`
+          )) as boolean
+          console.log(`[smoke] ${thawed ? 'PASS' : 'FAIL'} 清空选区后立刻补上冻结期间的日志`)
+        }
+
+        await js(
+          `[...document.querySelectorAll('.log-dialog .el-button')].find((b) => b.textContent.includes('复制全部'))?.click()`
+        )
+        await wait(400)
+        const clipAll = clipboard.readText()
+        console.log(
+          `[smoke] ${clipAll.length > logLen * 0.8 ? 'PASS' : 'FAIL'} 「复制全部」写进剪贴板（${clipAll.length} 字符）`
+        )
+
         await shot('thshell-docker-logs.png')
         await js(`document.querySelector('.log-dialog .el-dialog__headerbtn')?.click()`)
         await wait(600)
@@ -2646,6 +2970,69 @@ function createWindow(): void {
           ['登录会话两条', s?.sessions.length === 2, `${s?.sessions.length}`]
         ]
 
+        /**
+         * 未挂载磁盘的筛选规则：已挂载的、loop/sr0、以及"上面有分区但自己没文件系统的整盘"
+         * 都不该出现在列表里 —— 最后这条最容易错，整盘挂上去等于把分区表盖住。
+         */
+        const lsblkCanned = [
+          'NAME="sda" PATH="/dev/sda" SIZE="20G" TYPE="disk" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL="VMware Virtual disk"',
+          'NAME="sda1" PATH="/dev/sda1" SIZE="1G" TYPE="part" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL=""',
+          'NAME="sdb" PATH="/dev/sdb" SIZE="500G" TYPE="disk" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL="DATA"',
+          'NAME="sdb1" PATH="/dev/sdb1" SIZE="492G" TYPE="part" FSTYPE="xfs" MOUNTPOINT="" LABEL="data" MODEL=""',
+          'NAME="sdb2" PATH="/dev/sdb2" SIZE="8G" TYPE="part" FSTYPE="swap" MOUNTPOINT="[SWAP]" LABEL="" MODEL=""',
+          'NAME="sr0" PATH="/dev/sr0" SIZE="1024M" TYPE="rom" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL=""',
+          'NAME="loop0" PATH="/dev/loop0" SIZE="56M" TYPE="loop" FSTYPE="squashfs" MOUNTPOINT="/snap/core/1" LABEL="" MODEL=""'
+        ].join('\n')
+        const umDisks = await listUnmountedDisks(async () => ({
+          code: 0,
+          stdout: `@@LSBLK@@\n${lsblkCanned}\n@@FSTAB@@\n`,
+          stderr: ''
+        }))
+        checks.push(['未挂载磁盘：只留未挂载分区', umDisks.length === 3, umDisks.map((d) => d.path).join(',')])
+        checks.push(['未挂载磁盘：带文件系统的可挂', umDisks.some((d) => d.path === '/dev/sdb1' && d.fstype === 'xfs'), ''])
+        checks.push(['未挂载磁盘：空文件系统标出来', umDisks.some((d) => d.path === '/dev/sda1' && !d.fstype), ''])
+        checks.push(['未挂载磁盘：swap 分区单独标记', umDisks.some((d) => d.path === '/dev/sdb2' && d.isSwap), ''])
+        checks.push(['未挂载磁盘：不列整盘', !umDisks.some((d) => d.path === '/dev/sdb'), ''])
+        checks.push(['未挂载磁盘：不列 loop / 光驱', !umDisks.some((d) => /loop|sr0/.test(d.path)), ''])
+
+        /** 网络配置读取：nmcli 分支 */
+        const fakeNm = async (cmd: string) => {
+          if (cmd.includes('nmcli -t -f ipv4.method')) {
+            return {
+              code: 0,
+              stdout:
+                'ipv4.method:manual\nipv4.addresses:10.0.0.5/24\nipv4.gateway:10.0.0.1\nipv4.dns:8.8.8.8,1.1.1.1\n',
+              stderr: ''
+            }
+          }
+          return {
+            code: 0,
+            stdout:
+              '@@NM@@\nyes\n@@CON@@\nWired connection 1:ens160:802-3-ethernet:yes\neth-legacy:wlan0:802-11-wireless:no\n@@IFCFG@@\n@@NETPLAN@@\n',
+            stderr: ''
+          }
+        }
+        const nmCfg = await readNetConfig(fakeNm, 'ens160')
+        checks.push(['配网：认出 NetworkManager', nmCfg.backend === 'nmcli', nmCfg.backend])
+        checks.push(['配网：连接名跟设备名分开取', nmCfg.connName === 'Wired connection 1', nmCfg.connName])
+        checks.push(['配网：静态地址读成 CIDR', nmCfg.addresses[0] === '10.0.0.5/24', nmCfg.addresses.join(',')])
+        checks.push(['配网：DNS 拆成多条', nmCfg.dns.length === 2, nmCfg.dns.join(',')])
+
+        /** 网络配置读取：ifcfg 分支（没有 nmcli 的老 CentOS） */
+        const fakeIfcfg = async () => ({
+          code: 0,
+          stdout:
+            '@@NM@@\nno\n@@CON@@\n@@IFCFG@@\nDEVICE="eth0"\nBOOTPROTO="none"\nIPADDR="192.168.1.10"\nNETMASK="255.255.255.0"\nGATEWAY="192.168.1.1"\nDNS1="223.5.5.5"\nONBOOT="yes"\n@@NETPLAN@@\n',
+          stderr: ''
+        })
+        const ifcfgCfg = await readNetConfig(fakeIfcfg, 'eth0')
+        checks.push(['配网：认 ifcfg 文件', ifcfgCfg.backend === 'ifcfg', ifcfgCfg.backend])
+        checks.push([
+          '配网：NETMASK 折成前缀',
+          ifcfgCfg.addresses[0] === '192.168.1.10/24',
+          ifcfgCfg.addresses.join(',')
+        ])
+
         // 连真机看界面：解析对了不代表页面排得下
         await js(
           `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
@@ -2686,6 +3073,2780 @@ function createWindow(): void {
         const extraRows = (await js(`document.querySelectorAll('.sys .extra-row').length`)) as number
         checks.push(['展开虚拟网卡', extraRows > 0, `${extraRows} 行`])
         await shot('thshell-sysinfo-fold.png')
+
+        /**
+         * 未挂载磁盘：df 里根本不会出现它们，只能靠新增的 lsblk 扫描。
+         * 这台机器如果没有未挂载分区，"0 行 + 一句空态文案"就是正确结果。
+         */
+        const um = (await js(`(() => {
+          const box = document.querySelector('.sys .unmounted')
+          return {
+            exists: !!box,
+            rows: document.querySelectorAll('.sys .um-row').length,
+            err: document.querySelector('.sys .um-empty.err')?.textContent?.trim() || '',
+            empty: document.querySelector('.sys .um-empty:not(.err)')?.textContent?.trim() || ''
+          }
+        })()`)) as { exists: boolean; rows: number; err: string; empty: string }
+        checks.push(['未挂载磁盘区块存在', um.exists, ''])
+        checks.push(['未挂载扫描没有报错', !um.err, um.err || `行数=${um.rows}`])
+
+        // 网络配置弹窗：能打开、并且认得出这台机器用哪种方式管网络
+        await js(`(() => {
+          const b = [...document.querySelectorAll('.sys .iface .el-button')].find((x) =>
+            (x.textContent || '').includes('配置')
+          )
+          b?.click()
+          return 'ok'
+        })()`)
+        await wait(1600)
+        const netDlg = (await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')].find((x) =>
+            (x.textContent || '').includes('配置网络')
+          )
+          if (!d) return { open: false, chips: [], device: '' }
+          return {
+            open: true,
+            chips: [...d.querySelectorAll('.dlg-row .chip')].map((c) => (c.textContent || '').trim()),
+            device: d.querySelector('.dlg-row .dlg-v')?.textContent?.trim() || ''
+          }
+        })()`)) as { open: boolean; chips: string[]; device: string }
+        checks.push(['网络配置弹窗能打开', netDlg.open, netDlg.device])
+        checks.push([
+          '识别出网络管理方式',
+          netDlg.chips.length > 0 && !netDlg.chips.includes('未识别'),
+          netDlg.chips.join(' / ')
+        ])
+        await shot('thshell-syscfg.png')
+        // 关掉弹窗，别把遮罩留给后面的断言
+        await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')].find((x) =>
+            (x.textContent || '').includes('配置网络')
+          )
+          d?.querySelector('.el-dialog__headerbtn')?.click()
+          return 'ok'
+        })()`)
+        await wait(500)
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`)
+        }
+        console.log(`[smoke] sys ${failed ? failed + ' 项失败' : '全部通过'}`)
+
+        finish()
+        return
+      }
+
+      /**
+       * procs 模式：进程监控（htop 那一页）。
+       *
+       * 瞬时 CPU 是「两次采样求差」算出来的，这种算法最怕两件事：
+       * ① 首次采样没有 prev，直接算成 0（界面全是 0.0，不报错）；
+       * ② 分母用错（全机 ticks 增量 vs 单核 ticks），多核机器上直接差出 4 倍。
+       * 两种都只在图上表现为"数字不对劲"，所以必须有固定的 canned 用例钉住。
+       */
+      if (mode === 'procs') {
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        // 分隔符必须和 procs.ts 里一致：0x1F，不是 @@（ps 的 args 里可能带 @@，会切错段）
+        const SEP = '\x1f'
+        const canned = (ticks: number[], cpuCols: string): string =>
+          [
+            `${SEP}PS${SEP}`,
+            '  100     1 root     Ssl   2  1048576  3.5 /usr/bin/python3 main.py --epoch 10',
+            '  200     1 app      Sl    1   524288  1.0 /usr/bin/node app.js',
+            '  300   100 root     Z     0        0  0.0 [python3] <defunct>',
+            `${SEP}TICKS${SEP}`,
+            `100 ${ticks[0]}`,
+            `200 ${ticks[1]}`,
+            '300 40',
+            `${SEP}CPU${SEP}`,
+            `cpu  ${cpuCols}`,
+            `${SEP}CORES${SEP}`,
+            '4',
+            `${SEP}LOAD${SEP}`,
+            '1.20 0.90 0.70 3/200 999',
+            `${SEP}MEM${SEP}`,
+            'MemTotal:       32767684 kB',
+            'MemFree:         1234567 kB',
+            'MemAvailable:   20000000 kB',
+            'SwapTotal:       8388604 kB',
+            `${SEP}HTOP${SEP}`,
+            '',
+            `${SEP}PKG${SEP}`,
+            'apt',
+            `${SEP}OS${SEP}`,
+            'Ubuntu 22.04.4 LTS',
+            `${SEP}END${SEP}`
+          ].join('\n')
+
+        // 第一轮：user 1000 / sys 500 / idle 8000 / iowait 200 → total 9700
+        // 第二轮：user 1100 / sys 540 / idle 8060 / iowait 200 → total 9900，Δtotal 200，Δidle 60
+        //          进程 100 的 ticks 涨 50 → 50/200×4 核×100 = 100%（正好一个核跑满）
+        //          进程 200 的 ticks 涨 25 → 50%
+        const rounds = [
+          canned([500, 100], '1000 0 500 8000 200 0 0 0 0 0'),
+          canned([550, 125], '1100 0 540 8060 200 0 0 0 0 0')
+        ]
+        let round = 0
+        const fakeExec = async () => ({ code: 0, stdout: rounds[Math.min(round++, 1)], stderr: '' })
+
+        const first = await collectProcesses('smoke-procs', fakeExec)
+        const second = await collectProcesses('smoke-procs', fakeExec)
+
+        const p = (s: typeof first, pid: number) => s.rows.find((r) => r.pid === pid)
+        push(
+          '首次采样没有差值时用 ps 的 pcpu 兜底',
+          p(first, 100)?.cpu === 3.5 && p(first, 200)?.cpu === 1,
+          `${p(first, 100)?.cpu} / ${p(first, 200)?.cpu}`
+        )
+        push(
+          '第二次采样按 ticks 增量算瞬时 CPU（一核跑满 = 100%）',
+          p(second, 100)?.cpu === 100 && p(second, 200)?.cpu === 50,
+          `${p(second, 100)?.cpu}% / ${p(second, 200)?.cpu}%`
+        )
+        push(
+          '全机 CPU 按 idle 增量算（Δidle 60 / Δtotal 200 → 70%）',
+          second.stats.cpu === 70,
+          `${second.stats.cpu}%`
+        )
+        push(
+          '内存折算成 MB',
+          second.stats.memTotal === 32000 && second.stats.memUsed === 12468,
+          `${second.stats.memUsed}/${second.stats.memTotal} MB`
+        )
+        push(
+          '进程状态分类（睡眠 2 / 僵尸 1 / 线程 3）',
+          second.stats.sleeping === 2 &&
+            second.stats.zombie === 1 &&
+            second.stats.threads === 3,
+          `${second.stats.sleeping}/${second.stats.zombie}/${second.stats.threads}`
+        )
+        push(
+          '进程内存占比按 rss / MemTotal',
+          p(second, 100)?.mem === 3.2 && p(second, 200)?.mem === 1.6,
+          `${p(second, 100)?.mem}% / ${p(second, 200)?.mem}%`
+        )
+        push(
+          '没装 htop 时给出 apt 安装命令',
+          !second.htop.available && second.htop.install.includes('apt install -y htop'),
+          second.htop.install
+        )
+
+        // 结束进程的守卫：PID 1 和非法 PID 必须在发命令之前就拦住
+        const errMsg = (err: unknown): string =>
+          (err instanceof Error ? err.message : String(err)).replace(/^Error:\s*/i, '').trim()
+        let guard1 = ''
+        try {
+          await killProcess(fakeExec, 1, false)
+        } catch (err) {
+          guard1 = errMsg(err)
+        }
+        let guard2 = ''
+        try {
+          await killProcess(fakeExec, Number('abc'), true)
+        } catch (err) {
+          guard2 = errMsg(err)
+        }
+        push('拒绝结束 PID 1', guard1.includes('init'), guard1)
+        push('拒绝非法 PID', !!guard2, guard2)
+        clearProcState('smoke-procs')
+
+        /* ---------- 真机：连上去看界面 ---------- */
+        await wait(1500)
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        /*
+         * 连上之后还要跑 docker 探测，慢的时候十几秒才出页签。
+         * 死等固定时长会偶发"没连上"（假失败），这里轮询到出现为止。
+         */
+        /*
+         * 页签是连上之前就画出来的，但连接没完成时是 disabled 的，
+         * 这时候点等于没点（进程页永远空白）。所以要等到「可点」为止。
+         */
+        let hasSeg = false
+        for (let i = 0; i < 22; i++) {
+          hasSeg = (await js(
+            `(() => {
+              const b = [...document.querySelectorAll('.seg-btn')].find((x) => x.textContent.includes('进程'))
+              return !!b && !b.disabled
+            })()`
+          )) as boolean
+          if (hasSeg) break
+          await wait(1000)
+        }
+        push('「进程」页签在监控后面且可点', hasSeg)
+
+        if (hasSeg) {
+          await js(
+            `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('进程'))?.click()`
+          )
+          // 首次采样要等两次（第一次只建游标），3s 一轮，这里直接手动点刷新等结果
+          for (let i = 0; i < 20; i++) {
+            const n = (await js(`document.querySelectorAll('.proc .row').length`)) as number
+            if (n > 5) break
+            await wait(500)
+          }
+          const ui = (await js(`(() => {
+            const rows = [...document.querySelectorAll('.proc .row')]
+            const num = (el) => Number((el?.textContent || '').trim()) || 0
+            return {
+              rows: rows.length,
+              total: num(document.querySelector('.proc .meter:nth-child(4) b')),
+              firstCpu: num(rows[0]?.querySelector('.c-num')),
+              bars: document.querySelectorAll('.proc .cell-bar .bar').length,
+              hasSearch: !!document.querySelector('.proc .kw input'),
+              htopTip: !!document.querySelector('.proc .htop-tip'),
+              tipCmd: (document.querySelector('.proc .htop-tip code')?.textContent || '').trim(),
+              err: (document.querySelector('.proc .state .err')?.textContent || '').trim()
+            }
+          })()`)) as {
+            rows: number
+            total: number
+            firstCpu: number
+            bars: number
+            hasSearch: boolean
+            htopTip: boolean
+            tipCmd: string
+            err: string
+          }
+          push('真机进程表有数据', ui.rows > 5, `${ui.rows} 行${ui.err ? ' / ' + ui.err : ''}`)
+          push('概要里的进程总数和表一致', ui.total >= ui.rows, `${ui.total} / ${ui.rows}`)
+          push('CPU/MEM 百分比条渲染出来了', ui.bars >= ui.rows * 2, `${ui.bars} 条`)
+          push('有搜索框', ui.hasSearch)
+          // htop 装没装是环境相关，只要求"没装时提示条必须有命令"
+          if (ui.htopTip) push('没装 htop 时提示条给了安装命令', ui.tipCmd.length > 6, ui.tipCmd)
+
+          /* 按内存排序：点 MEM% 表头，第一行的值必须 >= 第二行。
+             点完必须等一次渲染 —— Vue 的 DOM 更新在下一个 tick，
+             同步读回来的还是点之前那一屏（会误判成"排序没生效"） */
+          const sorted = (await js(`(async () => {
+            const head = [...document.querySelectorAll('.proc .thead span')]
+            head.find((s) => s.textContent.includes('MEM'))?.click()
+            await new Promise((r) => setTimeout(r, 400))
+            const rows = [...document.querySelectorAll('.proc .row')]
+            const cells = (r) => [...(r?.querySelectorAll('.c-num') || [])]
+            const val = (r) => Number((cells(r)[1]?.textContent || '0').trim()) || 0
+            return {
+              a: val(rows[0]),
+              b: val(rows[1]),
+              n: rows.length,
+              cn: cells(rows[0]).length,
+              t: cells(rows[0]).map((c) => (c.textContent || '').trim())
+            }
+          })()`)) as { a: number; b: number; n: number; cn: number; t: string[] }
+          push('点 MEM% 表头能按内存降序', sorted.a > 0 && sorted.a >= sorted.b, JSON.stringify(sorted))
+
+          /* 搜索：输入一个不可能出现的串，结果必须是 0 行；清空后恢复 */
+          const searched = (await js(`(async () => {
+            const el = document.querySelector('.proc .kw input')
+            if (!el) return null
+            const set = (v) => {
+              el.value = v
+              el.dispatchEvent(new Event('input', { bubbles: true }))
+            }
+            set('zzz-no-such-proc-zzz')
+            await new Promise((r) => setTimeout(r, 300))
+            const zero = document.querySelectorAll('.proc .row').length
+            const empty = !!document.querySelector('.proc .empty')
+            set('')
+            await new Promise((r) => setTimeout(r, 300))
+            return { zero, empty, back: document.querySelectorAll('.proc .row').length }
+          })()`)) as { zero: number; empty: boolean; back: number } | null
+          push(
+            '搜索能过滤且清空后恢复',
+            !!searched && searched.zero === 0 && searched.empty && searched.back > 5,
+            JSON.stringify(searched)
+          )
+
+          await wait(400)
+          await shot('thshell-procs.png')
+
+          /**
+           * 这台机器装了 htop，所以真实界面里看不到「缺 htop」那条提示。
+           * 为了目检提示条长什么样（也为了以后改样式有个参照），临时插一条同结构的，
+           * 截完就摘掉，不参与断言。
+           */
+          if (!ui.htopTip) {
+            await js(`(() => {
+              const box = document.querySelector('.proc')
+              if (!box || document.querySelector('#htop-mock')) return 'skip'
+              const div = document.createElement('div')
+              div.className = 'htop-tip'
+              div.id = 'htop-mock'
+              // 动态插进来的元素没有 scoped 的 data-v 属性，组件里的样式管不到它，
+              // 这里照抄一份内联样式，只为了截图看着跟真实一致
+              div.style.cssText =
+                'flex:none;display:flex;align-items:center;gap:8px;padding:6px 12px;font-size:11px;' +
+                'color:var(--text-2);background:color-mix(in srgb, var(--accent) 8%, var(--bg-panel));' +
+                'border-bottom:1px solid var(--border-soft)'
+              div.innerHTML =
+                '<span style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+                '这台机器没有 htop（Ubuntu 22.04.4 LTS），下面这张表是内置采集的。想要完整 htop：</span>' +
+                '<code style="flex:none;padding:2px 8px;border-radius:4px;background:var(--bg-panel-2);' +
+                'color:var(--text-1);font-size:11px;white-space:nowrap">sudo apt update &amp;&amp; sudo apt install -y htop</code>' +
+                '<span style="flex:none;color:var(--accent);cursor:pointer">复制</span>' +
+                '<span style="flex:none;color:var(--accent);cursor:pointer">重新检测</span>'
+              box.insertBefore(div, box.firstChild)
+              return 'ok'
+            })()`)
+            await wait(300)
+            await shot('thshell-procs-htop-tip.png')
+            await js(`document.querySelector('#htop-mock')?.remove()`)
+          }
+
+          /* 结束进程按钮：默认 opacity:0，悬停才出现 —— 别让它在默认态就占满一列 */
+          const acts = (await js(`(() => {
+            const act = document.querySelector('.proc .row .c-act')
+            const row = document.querySelector('.proc .row')
+            if (!act || !row) return null
+            const before = getComputedStyle(act).opacity
+            row.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+            row.classList.add('hover')
+            return { before, btns: act.querySelectorAll('button').length }
+          })()`)) as { before: string; btns: number } | null
+          push('行内有结束/强杀按钮且默认隐藏', acts?.before === '0' && acts?.btns === 2, JSON.stringify(acts))
+
+          /**
+           * 卡顿回归。进程页 400 行、每 3 秒整表刷新，之前踩过两个坑：
+           * ① 每行两条百分比条都带 width 过渡 → 一次刷新 800 个动画同时跑；
+           * ② 按实时值全量重排 → 行在鼠标底下来回窜（hover 按钮、title 提示跟着闪）。
+           */
+          const perf = (await js(`(() => {
+            const rows = [...document.querySelectorAll('.proc .row')]
+            const bar = document.querySelector('.proc .row .cell-bar .bar')
+            const bcs = bar ? getComputedStyle(bar) : null
+            const rcs = rows[0] ? getComputedStyle(rows[0]) : null
+            return {
+              rows: rows.length,
+              cv: rcs ? rcs.contentVisibility || '' : '',
+              cis: rcs ? rcs.containIntrinsicSize || rcs.containIntrinsicBlockSize || '' : '',
+              trans: bcs ? bcs.transitionDuration : 'none',
+              anim: bcs ? bcs.animationName : 'none'
+            }
+          })()`)) as { rows: number; cv: string; cis: string; trans: string; anim: string }
+          push('屏外行不参与排版绘制（content-visibility）', perf.cv === 'auto', JSON.stringify(perf))
+          push('行内百分比条没挂着过渡动画', perf.trans === '0s' && perf.anim === 'none', `${perf.trans}/${perf.anim}`)
+
+          /* 自动刷新后表格不能整屏乱跳：同一批热点进程应该待在原位 */
+          const orderOf = async (): Promise<string[]> =>
+            (await js(
+              `[...document.querySelectorAll('.proc .row .c-pid')].slice(0, 40).map((e) => e.textContent)`
+            )) as string[]
+          const stampOf = async (): Promise<string> =>
+            (await js(`(document.querySelector('.proc .pfoot .mono')?.textContent || '').trim()`)) as string
+          const s0 = await stampOf()
+          const o0 = await orderOf()
+          let s1 = s0
+          for (let i = 0; i < 4 && s1 === s0; i++) {
+            await wait(2500)
+            s1 = await stampOf()
+          }
+          const o1 = await orderOf()
+          /*
+           * 只比"两轮都在"的那些进程的相对顺序：中途冒出来的新进程挤进前排，
+           * 会让后面的名次整体位移一位，那不是"乱跳"，用它当指标会误报。
+           */
+          const common = o0.filter((pid) => o1.includes(pid))
+          const commonAfter = o1.filter((pid) => o0.includes(pid))
+          const moved = common.filter((pid, i) => commonAfter[i] !== pid).length
+          push(
+            '自动刷新后热点进程的相对顺序不乱跳',
+            s1 !== s0 && moved <= 15,
+            JSON.stringify({ refreshed: s1 !== s0, moved, keep: common.length, s1 })
+          )
+          push(
+            '刷新间隔如实写在勾选框上',
+            (await js(
+              `[...document.querySelectorAll('.proc-bar .el-checkbox__label')].some((e) => /每 \\d+ 秒刷新/.test(e.textContent || ''))`
+            )) === true,
+            ''
+          )
+        }
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`)
+        }
+        console.log(`[smoke] procs ${failed ? failed + ' 项失败' : '全部通过'}`)
+
+        finish()
+        return
+      }
+
+      // services 模式：systemd 服务列表（合并两份输出）+ 启停动作的边界。
+      // 真机上**不点启动/停止/重启** —— 那是生产服务器，冒烟只验证解析和按钮在不在。
+      if (mode === 'services') {
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        const SEP = '\x1f'
+        const canned = (units: string[], files: string[], init = 'systemd'): string =>
+          [
+            `${SEP}UNITS${SEP}`,
+            ...units,
+            `${SEP}FILES${SEP}`,
+            ...files,
+            `${SEP}VER${SEP}`,
+            'systemd 249 (249.11-0ubuntu3.12)',
+            `${SEP}INIT${SEP}`,
+            init,
+            `${SEP}END${SEP}`
+          ].join('\n')
+
+        const healthy = canned(
+          [
+            // 老版本 systemd 会给 failed 单元加个 ● 前缀，解析必须剥掉它
+            '\u25CF nginx.service   loaded failed failed  A high performance web server',
+            '  cron.service    loaded active running Regular background program processing daemon',
+            '  ssh.service     loaded active running OpenBSD Secure Shell server',
+            '  dbus.service    loaded inactive dead  D-Bus System Message Bus'
+          ],
+          [
+            'cron.service        enabled  enabled',
+            'dbus.service        static   -',
+            'nginx.service       enabled  enabled',
+            'redis.service       disabled disabled'
+          ]
+        )
+
+        const snap = await collectServices(async () => ({ code: 0, stdout: healthy, stderr: '' }))
+        const byName = (n: string) => snap.rows.find((r) => r.name === n)
+
+        push(
+          '两份输出按名字合并（4 个已加载 + 1 个只装在磁盘上）',
+          snap.rows.length === 5 && !!byName('redis.service'),
+          `${snap.rows.length} 条`
+        )
+        push(
+          'failed 单元被识别并计数',
+          byName('nginx.service')?.active === 'failed' && snap.stats.failed === 1,
+          `active=${byName('nginx.service')?.active} failed=${snap.stats.failed}`
+        )
+        push(
+          '● 前缀不影响服务名解析',
+          byName('nginx.service')?.description.includes('high performance') === true,
+          byName('nginx.service')?.description ?? '没解析出来'
+        )
+        push(
+          '运行中数量按 active 统计',
+          snap.stats.running === 2 && snap.stats.inactive === 1,
+          `running=${snap.stats.running} inactive=${snap.stats.inactive}`
+        )
+        push(
+          '开机自启态从 list-unit-files 回填到已加载的单元',
+          byName('cron.service')?.enabled === 'enabled' && byName('dbus.service')?.enabled === 'static',
+          `cron=${byName('cron.service')?.enabled} dbus=${byName('dbus.service')?.enabled}`
+        )
+        push(
+          '只存在于 unit 文件里的服务标成「未加载」而不是「已停止」',
+          byName('redis.service')?.loaded === false && byName('redis.service')?.enabled === 'disabled',
+          `loaded=${byName('redis.service')?.loaded}`
+        )
+
+        /* 容器 / WSL：不是 systemd 就得说清楚，不能给一张空表 */
+        const noSysd = canned(
+          ["System has not been booted with systemd as init system (PID 1). Can't operate."],
+          [],
+          'tini'
+        )
+        const dockerLike = await collectServices(async () => ({ code: 0, stdout: noSysd, stderr: '' }))
+        push(
+          '没有 systemd 时给 available=false + 原因',
+          !dockerLike.systemd.available &&
+            dockerLike.systemd.init === 'tini' &&
+            dockerLike.systemd.hint.includes('systemd'),
+          `init=${dockerLike.systemd.init}`
+        )
+
+        /* ---- 动作：权限探测 / 命令拼装 / 白名单 ---- */
+        const sent: string[] = []
+        let rc = '0'
+        const traceExec = async (command: string) => {
+          sent.push(command)
+          if (command === 'id -u 2>/dev/null') return { code: 0, stdout: '1000\n', stderr: '' }
+          if (command.startsWith('sudo -n true')) return { code: 0, stdout: '', stderr: '' }
+          return { code: 0, stdout: `rc=${rc}`, stderr: '' }
+        }
+
+        const okMsg = await serviceAction(traceExec, 'smoke-svc', 'nginx.service', 'restart')
+        push(
+          '非 root 时自动加 sudo -n 前缀，服务名单引号包裹',
+          sent.some((c) => c.includes("sudo -n systemctl restart 'nginx.service'")),
+          sent[sent.length - 1]?.slice(0, 60) ?? ''
+        )
+        push('成功的回执写的是中文动作', okMsg.includes('已重启'), okMsg)
+
+        const before = sent.length
+        await serviceAction(traceExec, 'smoke-svc', 'cron.service', 'start')
+        push(
+          '权限判断结果按会话缓存（同一会话不再跑 id -u）',
+          sent.filter((c) => c === 'id -u 2>/dev/null').length === 1,
+          `${sent.length - before} 条新命令`
+        )
+
+        rc = '5'
+        let failMsg = ''
+        try {
+          await serviceAction(traceExec, 'smoke-svc', 'ghost.service', 'start')
+        } catch (err) {
+          failMsg = err instanceof Error ? err.message : String(err)
+        }
+        push('退出码非 0 时把 systemctl 的原话抛出来', failMsg.includes('rc') || failMsg.length > 0, failMsg)
+
+        const guardBefore = sent.length
+        let nameErr = ''
+        try {
+          // 服务名会拼进 shell：带分号的必须在校验阶段就被拦住，一条命令都不许发
+          await serviceAction(traceExec, 'smoke-svc', 'nginx.service; rm -rf /', 'stop')
+        } catch (err) {
+          nameErr = err instanceof Error ? err.message : String(err)
+        }
+        push(
+          '非法服务名在发命令之前就被拦住',
+          nameErr.includes('非法') && sent.length === guardBefore,
+          `${nameErr} / 多发 ${sent.length - guardBefore} 条`
+        )
+
+        clearServiceState('smoke-svc')
+
+        /* ---- 日志：解析 / 增量去重 / sudo 回退（都在进程内验，不碰生产机） ---- */
+        const journalRaw = [
+          '-- Logs begin at Tue 2026-11-25 10:00:00 CST, end at Thu 2026-11-26 16:20:40 CST. --',
+          '2026-11-26T16:20:31+0800 host systemd[1]: Starting nginx...',
+          '2026-11-26T16:20:31+0800 host nginx[812]: started',
+          '2026-11-26T16:20:32+0800 host systemd[1]: Started nginx.',
+          'Hint: You are currently not seeing messages from other users and the system.'
+        ].join('\n')
+
+        const parsedLog = parseJournal(journalRaw)
+        push(
+          '页眉不算日志，Hint 单独拎出来当提示',
+          parsedLog.lines.length === 3 &&
+            !parsedLog.lines.some((l) => l.startsWith('-- Logs begin')) &&
+            parsedLog.hint.includes('not seeing messages'),
+          `${parsedLog.lines.length} 行 / hint=${parsedLog.hint.slice(0, 36)}`
+        )
+
+        /*
+         * `--since` 是闭区间：上一轮最后一秒会被重吐一遍。
+         * 按时间戳 `>` 过滤会丢掉同一秒后来的行（高频服务一秒几十条），
+         * 所以要按「那一秒已经收过几条」精确跳过。
+         */
+        const deltaLog = dropSeen(parsedLog.lines, '2026-11-26 16:20:31', 1)
+        push(
+          '增量按「同秒已收条数」去重，同秒后来的行不会丢',
+          deltaLog.length === 2 && deltaLog[0].includes('nginx[812]'),
+          `${deltaLog.length} 行`
+        )
+
+        const logSent: string[] = []
+        const logExec = async (command: string) => {
+          logSent.push(command)
+          if (command === 'id -u 2>/dev/null') return { code: 0, stdout: '0\n', stderr: '' }
+          return { code: 0, stdout: journalRaw, stderr: '' }
+        }
+
+        const firstLog = await serviceLogs(logExec, 'smoke-log', 'nginx.service', { lines: 300 })
+        push(
+          '首屏用 journalctl -u + short-iso + 行数上限',
+          !!logSent[0] &&
+            logSent[0].includes("journalctl -u 'nginx.service'") &&
+            logSent[0].includes('--no-pager') &&
+            logSent[0].includes('-o short-iso') &&
+            logSent[0].includes('-n 300'),
+          logSent[0]?.slice(0, 96) ?? ''
+        )
+        push(
+          '游标停在最后一行的秒上，并记下那一秒有几条',
+          firstLog.cursor === '2026-11-26 16:20:32' && firstLog.cursorCount === 1,
+          `${firstLog.cursor} / ${firstLog.cursorCount} 条`
+        )
+
+        logSent.length = 0
+        const nextLog = await serviceLogs(logExec, 'smoke-log', 'nginx.service', {
+          lines: 300,
+          since: '2026-11-26 16:20:31',
+          skip: 1
+        })
+        push(
+          '增量只带 --since，不再从头拉',
+          !!logSent[0] && logSent[0].includes("--since '2026-11-26 16:20:31'"),
+          logSent[0]?.slice(0, 96) ?? ''
+        )
+        push('增量结果里没有重复行', nextLog.lines.length === 2, `${nextLog.lines.length} 行`)
+
+        const sudoSent: string[] = []
+        const sudoLog = await serviceLogs(
+          async (command: string) => {
+            sudoSent.push(command)
+            if (command === 'id -u 2>/dev/null') return { code: 0, stdout: '1001\n', stderr: '' }
+            if (command.startsWith('sudo -n true')) return { code: 0, stdout: '', stderr: '' }
+            if (command.startsWith('sudo -n journalctl')) {
+              return {
+                code: 0,
+                stdout: '2026-11-26T10:00:00+0800 host systemd[1]: Started cron.',
+                stderr: ''
+              }
+            }
+            return {
+              code: 0,
+              stdout: 'Hint: You are currently not seeing messages from other users and the system.\n',
+              stderr: ''
+            }
+          },
+          'smoke-log2',
+          'cron.service',
+          { lines: 100 }
+        )
+        push(
+          '普通账号读不到系统日志且配了免密 sudo 时自动重试',
+          sudoLog.source === 'sudo' &&
+            sudoLog.lines.length === 1 &&
+            sudoSent.some((c) => c.startsWith("sudo -n journalctl -u 'cron.service'")),
+          `${sudoLog.source} / ${sudoLog.lines.length} 行`
+        )
+        clearServiceState('smoke-log2')
+
+        const noSudoLog = await serviceLogs(
+          async (command: string) => {
+            if (command === 'id -u 2>/dev/null') return { code: 0, stdout: '1001\n', stderr: '' }
+            if (command.startsWith('sudo -n true')) {
+              return { code: 1, stdout: 'sudo: a password is required', stderr: '' }
+            }
+            return {
+              code: 0,
+              stdout: 'Hint: You are currently not seeing messages from other users and the system.\n',
+              stderr: ''
+            }
+          },
+          'smoke-log3',
+          'cron.service',
+          { lines: 100 }
+        )
+        push(
+          '没有免密 sudo 时说清「为什么只看到一部分」',
+          noSudoLog.source === 'user' && noSudoLog.note.includes('免密 sudo'),
+          noSudoLog.note.slice(0, 52)
+        )
+        clearServiceState('smoke-log3')
+
+        const logGuardBefore = logSent.length
+        let logNameErr = ''
+        try {
+          await serviceLogs(logExec, 'smoke-log', 'nginx.service; reboot', { lines: 100 })
+        } catch (err) {
+          logNameErr = err instanceof Error ? err.message : String(err)
+        }
+        push(
+          '日志接口同样在发命令之前拦住非法服务名',
+          logNameErr.includes('非法') && logSent.length === logGuardBefore,
+          logNameErr || '没报错'
+        )
+        clearServiceState('smoke-log')
+
+        /* ---------- 真机：连上去看界面（不点启停，别动生产服务） ---------- */
+        await wait(1500)
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+
+        let hasSeg = false
+        for (let i = 0; i < 22; i++) {
+          hasSeg = (await js(
+            `(() => {
+              const b = [...document.querySelectorAll('.seg-btn')].find((x) => x.textContent.includes('系统服务'))
+              return !!b && !b.disabled
+            })()`
+          )) as boolean
+          if (hasSeg) break
+          await wait(1000)
+        }
+        push('「系统服务」页签在「系统」后面且可点', hasSeg)
+
+        if (hasSeg) {
+          const order = (await js(
+            `[...document.querySelectorAll('.seg-btn')].map((b) => b.textContent.trim())`
+          )) as string[]
+          const iSys = order.findIndex((t) => t.includes('系统') && !t.includes('服务'))
+          const iSvc = order.findIndex((t) => t.includes('系统服务'))
+          push('页签顺序：系统 → 系统服务', iSys >= 0 && iSvc === iSys + 1, order.join(' | '))
+
+          await js(
+            `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('系统服务'))?.click()`
+          )
+          for (let i = 0; i < 30; i++) {
+            const n = (await js(`document.querySelectorAll('.svc .row').length`)) as number
+            if (n > 5) break
+            await wait(500)
+          }
+
+          const ui = (await js(`(() => {
+            const rows = [...document.querySelectorAll('.svc .row')]
+            const first = rows[0]
+            return {
+              rows: rows.length,
+              names: rows.slice(0, 3).map((r) => (r.querySelector('.c-name')?.textContent || '').trim()),
+              dots: document.querySelectorAll('.svc .row .dot').length,
+              filters: [...document.querySelectorAll('.svc .fbtn')].map((b) => (b.textContent || '').replace(/\\s+/g, ' ').trim()),
+              hasSearch: !!document.querySelector('.svc .kw input'),
+              noSystemd: !!document.querySelector('.svc .state'),
+              firstActs: first ? first.querySelectorAll('.act').length : 0,
+              lastAct: (first?.querySelectorAll('.act') || [])[0]?.textContent?.trim() || '',
+              cv: first ? getComputedStyle(first).contentVisibility : ''
+            }
+          })()`)) as {
+            rows: number
+            names: string[]
+            dots: number
+            filters: string[]
+            hasSearch: boolean
+            noSystemd: boolean
+            firstActs: number
+            lastAct: string
+            cv: string
+          }
+
+          push('真机服务表有数据', ui.rows > 5, `${ui.rows} 行${ui.noSystemd ? '（系统页提示：没有 systemd）' : ''}`)
+          push('服务名带 .service 后缀', ui.names.every((n) => n.endsWith('.service')), ui.names.join(' / '))
+          push('每行都有状态点', ui.dots >= ui.rows, `${ui.dots} 个`)
+          push(
+            '五个筛选项都带数量',
+            ui.filters.length === 5 && ui.filters.every((t) => /\d/.test(t)),
+            ui.filters.join(' | ')
+          )
+          /*
+           * 分类必须互不重叠、加起来正好是全部：数字对不上时用户会以为漏了服务。
+           * 从界面上读四个数字回来算，不依赖内部的 counts 实现。
+           */
+          const nums = ui.filters.map((t) => Number(/(\d+)\s*$/.exec(t)?.[1] ?? NaN))
+          push(
+            '筛选分类加起来等于总数',
+            nums.length === 5 &&
+              nums.every((n) => Number.isFinite(n)) &&
+              nums[1] + nums[2] + nums[3] + nums[4] === nums[0],
+            `${nums.join('+')}`
+          )
+          push('有搜索框', ui.hasSearch)
+          push('屏外行不参与排版绘制（content-visibility）', ui.cv === 'auto', ui.cv)
+
+          /* 点了一行才有按钮：默认 opacity:0，不能一直铺在表格里 */
+          const act = (await js(`(() => {
+            const row = document.querySelector('.svc .row')
+            const box = row?.querySelector('.c-act')
+            if (!box) return null
+            const before = getComputedStyle(box).opacity
+            return { before, btns: box.querySelectorAll('button').length, labels: [...box.querySelectorAll('button')].map((b) => b.textContent.trim()) }
+          })()`)) as { before: string; btns: number; labels: string[] } | null
+          push(
+            '动作按钮默认隐藏，悬停才出现',
+            act?.before === '0' && act.btns >= 1,
+            JSON.stringify(act)
+          )
+          push(
+            '「运行中」的服务给的是停止/重启',
+            !!act && act.labels.includes('重启') && act.labels.includes('停止'),
+            act?.labels.join(' / ') ?? ''
+          )
+
+          /*
+           * 悬停显形的验证必须走真实鼠标输入。
+           * CSS :hover 不会被 dispatchEvent 造出来的合成事件触发，
+           * 用合成事件去测只会拿到 opacity:0 然后误判成"按钮没做出来"。
+           */
+          const hoverBox = (await js(`(() => {
+            const row = document.querySelector('.svc .row')
+            const btn = row?.querySelector('.c-act button')
+            if (!row || !btn) return null
+            const r = btn.getBoundingClientRect()
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+          })()`)) as { x: number; y: number } | null
+          if (hoverBox) {
+            mainWindow!.webContents.sendInputEvent({
+              type: 'mouseMove',
+              x: hoverBox.x,
+              y: hoverBox.y
+            })
+            await wait(350)
+            const hoverOpacity = (await js(
+              `getComputedStyle(document.querySelector('.svc .row .c-act')).opacity`
+            )) as string
+            push('鼠标移到行上，操作按钮显形', hoverOpacity === '1', `opacity=${hoverOpacity}`)
+            await shot('thshell-services-hover.png')
+            // 移开，别让后面的截图带着一排按钮
+            mainWindow!.webContents.sendInputEvent({
+              type: 'mouseMove',
+              x: Math.round(hoverBox.x / 3),
+              y: 6
+            })
+            await wait(250)
+          } else {
+            push('鼠标移到行上，操作按钮显形', false, '没找到按钮')
+          }
+
+          /* 筛选：点「失败」后剩下的行状态必须全是失败 */
+          const filtered = (await js(`(async () => {
+            const pick = (t) => [...document.querySelectorAll('.svc .fbtn')].find((b) => b.textContent.includes(t))
+            pick('失败')?.click()
+            await new Promise((r) => setTimeout(r, 300))
+            const rows = [...document.querySelectorAll('.svc .row')]
+            const texts = rows.map((r) => (r.querySelector('.st')?.textContent || '').trim())
+            const empty = !!document.querySelector('.svc .empty')
+            // 「未运行」那一项的数量必须和列表实际行数一致（分类不能重叠也不能漏）
+            const chip = Number(/(\\d+)\\s*$/.exec(pick('未运行')?.textContent || '')?.[1] ?? -1)
+            pick('未运行')?.click()
+            await new Promise((r) => setTimeout(r, 300))
+            const stoppedRows = document.querySelectorAll('.svc .row').length
+            // 「未加载」里的每一行状态都必须写「未加载」
+            pick('未加载')?.click()
+            await new Promise((r) => setTimeout(r, 300))
+            const idleRows = [...document.querySelectorAll('.svc .row')]
+            const idleTexts = idleRows.map((r) => (r.querySelector('.st')?.textContent || '').trim())
+            pick('全部')?.click()
+            await new Promise((r) => setTimeout(r, 300))
+            return {
+              n: rows.length,
+              bad: texts.filter((t) => t !== '失败').length,
+              empty,
+              chip,
+              stoppedRows,
+              idleN: idleRows.length,
+              idleBad: idleTexts.filter((t) => t !== '未加载').length,
+              back: document.querySelectorAll('.svc .row').length
+            }
+          })()`)) as {
+            n: number
+            bad: number
+            empty: boolean
+            chip: number
+            stoppedRows: number
+            idleN: number
+            idleBad: number
+            back: number
+          }
+          push(
+            '按「失败」筛选后只剩失败的服务，切回全部能恢复',
+            filtered.bad === 0 && (filtered.n === 0 ? filtered.empty : true) && filtered.back > 5,
+            JSON.stringify(filtered)
+          )
+          push(
+            '「未运行」的条目数和筛选按钮上的数字一致',
+            filtered.chip === filtered.stoppedRows,
+            `${filtered.stoppedRows} 行 / 标签写 ${filtered.chip}`
+          )
+          push(
+            '「未加载」里的行状态全部写「未加载」（不谎报成已停止）',
+            filtered.idleBad === 0,
+            `${filtered.idleN} 行`
+          )
+
+          /* 搜索：不存在的服务名 → 空态；清空 → 复原 */
+          const searched = (await js(`(async () => {
+            const el = document.querySelector('.svc .kw input')
+            if (!el) return null
+            const set = (v) => {
+              el.value = v
+              el.dispatchEvent(new Event('input', { bubbles: true }))
+            }
+            set('zzz-no-such-service-zzz')
+            await new Promise((r) => setTimeout(r, 300))
+            const zero = document.querySelectorAll('.svc .row').length
+            const empty = (document.querySelector('.svc .empty')?.textContent || '').trim()
+            set('')
+            await new Promise((r) => setTimeout(r, 300))
+            return { zero, empty, back: document.querySelectorAll('.svc .row').length }
+          })()`)) as { zero: number; empty: string; back: number } | null
+          push(
+            '搜索能过滤且清空后恢复',
+            !!searched && searched.zero === 0 && searched.empty.includes('zzz') && searched.back > 5,
+            JSON.stringify(searched)
+          )
+
+          await wait(300)
+          await shot('thshell-services.png')
+
+          /* ---------- 日志浮层：打开 → 有内容 → 可选中 → 关掉 ----------
+           * 点哪个服务不确定这台机器哪个有日志，按 ssh → cron → 第一行的顺序试。
+           * 只读操作，随便点没有副作用。 */
+          const openLogOf = async (name: string) => {
+            await js(`(() => {
+              const rows = [...document.querySelectorAll('.svc .row')]
+              const target = rows.find(
+                (r) => (r.querySelector('.c-name')?.textContent || '').trim() === ${JSON.stringify(name)}
+              ) || rows[0]
+              target?.querySelector('.act.log')?.click()
+              return (target?.querySelector('.c-name')?.textContent || '').trim()
+            })()`)
+            let state: { n: number; empty: boolean } | null = null
+            for (let i = 0; i < 12; i++) {
+              await wait(600)
+              state = (await js(`(() => {
+                const box = document.querySelector('.svc .lg')
+                if (!box) return null
+                return {
+                  n: box.querySelectorAll('.ln').length,
+                  empty: !!(box.querySelector('.lg-state') && !box.querySelector('.lg-state.bad'))
+                }
+              })()`)) as { n: number; empty: boolean } | null
+              if (state && (state.n > 0 || state.empty)) return state
+            }
+            return null
+          }
+
+          let logProbe: { n: number; empty: boolean } | null = null
+          let logName = ''
+          for (const cand of ['ssh.service', 'cron.service', '']) {
+            const got = await openLogOf(cand)
+            if (got && got.n > 0) {
+              logProbe = got
+              break
+            }
+            // 没翻出日志就关掉换下一个，面板开着会挡住表格
+            await js(`document.querySelector('.svc .lg-x')?.click()`)
+            await wait(250)
+          }
+          push(
+            '点「日志」能翻出对应服务的 journalctl 输出',
+            !!logProbe && logProbe.n > 0,
+            `${logProbe?.n ?? 0} 行${logProbe?.n ? '' : '（候选都没有日志）'}`
+          )
+
+          const logUi = (await js(`(() => {
+            const box = document.querySelector('.svc .lg')
+            if (!box) return null
+            return {
+              title: (box.querySelector('.lg-title')?.textContent || '').trim(),
+              cmd: (box.querySelector('.lg-cmd')?.textContent || '').trim(),
+              stamps: [...box.querySelectorAll('.ln .ts')].slice(0, 3).map((s) => (s.textContent || '').trim()),
+              selectable: getComputedStyle(box.querySelector('.lg-body')).userSelect,
+              live: !!box.querySelector('.el-checkbox input')?.checked,
+              meta: (box.querySelector('.lg-meta')?.textContent || '').trim()
+            }
+          })()`)) as {
+            title: string
+            cmd: string
+            stamps: string[]
+            selectable: string
+            live: boolean
+            meta: string
+          } | null
+          push(
+            '面板标题和命令行都是同一个服务',
+            !!logUi && logUi.cmd.includes(`journalctl -u ${logUi.title}`),
+            logUi ? `${logUi.title} / ${logUi.cmd}` : ''
+          )
+          push(
+            'journalctl short-iso 的时间戳拆出来单独一层',
+            !!logUi && logUi.stamps.length > 0 && logUi.stamps.every((s) => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)),
+            logUi?.stamps.join(' | ') ?? ''
+          )
+          push('日志正文可以选中（user-select:text）', logUi?.selectable === 'text', logUi?.selectable ?? '')
+          push('实时跟随默认打开', !!logUi?.live, logUi?.meta ?? '')
+          await shot('thshell-services-log.png')
+
+          /*
+           * 面板开着时直接点另一个服务的「日志」：浮层必须整个换成新服务的日志。
+           * 这里吃过亏 —— 组件没挂 key 时 props 换了 state 还留着，
+           * 标题写新服务、内容还是上一个的，用户一眼就看出"日志串了"。
+           */
+          const before2 = (await js(
+            `(document.querySelector('.svc .lg .lg-title')?.textContent || '').trim()`
+          )) as string
+          const after2 = (await js(`(async () => {
+            const rows = [...document.querySelectorAll('.svc .row')]
+            const other = rows.find(
+              (r) => (r.querySelector('.c-name')?.textContent || '').trim() !== ${JSON.stringify(before2)} &&
+                r.querySelector('.act.log')
+            )
+            const name = (other?.querySelector('.c-name')?.textContent || '').trim()
+            other?.querySelector('.act.log')?.click()
+            await new Promise((res) => setTimeout(res, 1200))
+            const box = document.querySelector('.svc .lg')
+            return {
+              name,
+              title: (box?.querySelector('.lg-title')?.textContent || '').trim(),
+              cmd: (box?.querySelector('.lg-cmd')?.textContent || '').trim(),
+              n: box ? box.querySelectorAll('.ln').length : -1
+            }
+          })()`)) as { name: string; title: string; cmd: string; n: number }
+          push(
+            '开着 A 的日志点 B，浮层整个换成 B 的日志',
+            !!after2 &&
+              after2.name !== before2 &&
+              after2.title === after2.name &&
+              after2.cmd.includes(`journalctl -u ${after2.name}`) &&
+              after2.n > 0,
+            `${before2} → ${after2?.title ?? '没变化'} · ${after2?.n ?? 0} 行`
+          )
+
+          // 关掉后面板必须消失、表格还在 —— 浮层不能把服务表吞了
+          await js(`document.querySelector('.svc .lg-x')?.click()`)
+          await wait(300)
+          push(
+            '关掉日志面板后表格还在',
+            (await js(
+              `!document.querySelector('.svc .lg') && document.querySelectorAll('.svc .row').length > 5`
+            )) as boolean,
+            ''
+          )
+
+          /* 顺带把「启动」按钮长什么样也留一张：未运行的服务才会有它 */
+          const started = (await js(`(async () => {
+            const stopped = [...document.querySelectorAll('.svc .fbtn')].find((b) => b.textContent.includes('未运行'))
+            stopped?.click()
+            await new Promise((r) => setTimeout(r, 300))
+            const labels = [...document.querySelectorAll('.svc .row .act')].map((b) => b.textContent.trim())
+            return { n: document.querySelectorAll('.svc .row').length, labels: [...new Set(labels)] }
+          })()`)) as { n: number; labels: string[] }
+          push(
+            '未运行的服务给的是「启动」',
+            started.labels.includes('启动'),
+            `${started.n} 行 · ${started.labels.join(' / ')}`
+          )
+          await shot('thshell-services-stopped.png')
+        }
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`)
+        }
+        console.log(`[smoke] services ${failed ? failed + ' 项失败' : '全部通过'}`)
+
+        finish()
+        return
+      }
+
+      // edit 模式：双击文件进内置编辑器（本地 + 远程），验证"能编辑的判断、读、改、存"整条链路。
+      // 用真实的临时目录和 /etc 下的真文件，别拿假数据糊过去 —— 读写落到磁盘才算数。
+      if (mode === 'edit') {
+        await wait(1500)
+
+        const dir = path.join(os.tmpdir(), 'thshell-edit-smoke')
+        fs.rmSync(dir, { recursive: true, force: true })
+        fs.mkdirSync(dir, { recursive: true })
+        const textFile = path.join(dir, 'conf.txt')
+        const binFile = path.join(dir, 'blob.bin')
+        fs.writeFileSync(textFile, 'server {\n  listen 80;\n}\n', 'utf-8')
+        // 头几个字节就给 NUL，模拟"扩展名看不出来但确实是二进制"的文件
+        fs.writeFileSync(binFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x01, 0x02]))
+
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        await wait(5000)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(1800)
+
+        /** 把某一栏切到指定目录：路径输入框是 v-model，得先派发 input 再回车 */
+        const goto = (pane: number, target: string) =>
+          js(`(() => {
+            const el = document.querySelectorAll('.fm .pane')[${pane}]?.querySelector('.path-input')
+            if (!el) return 'no-input'
+            el.value = ${JSON.stringify(target)}
+            el.dispatchEvent(new Event('input', { bubbles: true }))
+            el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+            return 'ok'
+          })()`)
+
+        const dblclickRow = (pane: number, name: string) =>
+          js(`(() => {
+            const rows = document.querySelectorAll('.fm .pane')[${pane}]?.querySelectorAll('.rows .row') || []
+            const row = [...rows].find((r) => r.textContent.includes(${JSON.stringify(name)}))
+            if (!row) return 'no-row'
+            row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+            return 'ok'
+          })()`)
+
+        const editorState = () =>
+          js(`(() => {
+            const dlg = document.querySelector('.edit-dialog')
+            if (!dlg) return null
+            // 编辑器换成 CodeMirror 之后没有 textarea 了，内容在 .cm-line 里
+            const lines = [...dlg.querySelectorAll('.cm-line')].map((l) => l.textContent)
+            // el-dialog 关掉后外壳可能还留在 DOM 里（display:none），不能只看节点在不在
+            const overlay = dlg.closest('.el-overlay') || dlg
+            const open =
+              getComputedStyle(overlay).display !== 'none' && overlay.getBoundingClientRect().height > 0
+            return {
+              open,
+              badge: dlg.querySelector('.edit-badge')?.textContent.trim() || '',
+              name: dlg.querySelector('.edit-name')?.textContent.trim() || '',
+              value: lines.join('\\n'),
+              dirty: !!dlg.querySelector('.edit-dirty'),
+              saveDisabled: !!dlg.querySelector('.el-button--primary')?.disabled
+            }
+          })()`) as Promise<{
+          open: boolean
+          badge: string
+          name: string
+          value: string
+          dirty: boolean
+          saveDisabled: boolean
+        } | null>
+
+        const checks: [string, boolean, string][] = []
+
+        // ---------- 本地：双击文本文件 → 编辑器 ----------
+        await goto(0, dir)
+        await wait(900)
+        const openLocal = await dblclickRow(0, 'conf.txt')
+        await wait(700)
+        let st = await editorState()
+        checks.push(['双击本地文本文件', openLocal === 'ok' && !!st, openLocal])
+        checks.push(['弹窗标为「本地」', st?.badge === '本地', st?.badge || '无'])
+        checks.push(['文件名正确', st?.name === 'conf.txt', st?.name || '无'])
+        checks.push(['读到了内容', (st?.value || '').includes('listen 80'), (st?.value || '').slice(0, 24)])
+        checks.push(['初始不算脏', st?.dirty === false, ''])
+        checks.push(['未改动时保存按钮禁用', st?.saveDisabled === true, ''])
+
+        // ---------- 改内容 → 脏 → 保存 → 落盘 ----------
+        /**
+         * 往 CodeMirror 里插入文本。
+         * 不能再直接改 value（contenteditable 没有 value），走 DOM 层插入：
+         * 先把选区折叠到文末，再 execCommand('insertText')。CM6 用 DOM 观察器接管浏览器输入，
+         * 这样插进去的字对它来说就是一次正常编辑，会走 onUpdate → v-model 更新。
+         */
+        const typeIntoEditor = (text: string) =>
+          js(`(() => {
+            const cm = document.querySelector('.edit-dialog .cm-content')
+            if (!cm) return 'no-cm'
+            cm.focus()
+            const sel = window.getSelection()
+            const range = document.createRange()
+            range.selectNodeContents(cm)
+            range.collapse(false)
+            sel.removeAllRanges()
+            sel.addRange(range)
+            return document.execCommand('insertText', false, ${JSON.stringify(text)}) ? 'ok' : 'exec-failed'
+          })()`)
+
+        mainWindow!.focus()
+        const typed = await typeIntoEditor('\n// patched by smoke')
+        await wait(400)
+        st = await editorState()
+        checks.push(['改动后标记未保存', st?.dirty === true, `type=${typed}`])
+        checks.push(['改动后保存按钮可用', st?.saveDisabled === false, ''])
+        await wait(300)
+        await shot('thshell-editor-dirty.png')
+
+        await js(
+          `document.querySelector('.edit-dialog .el-button--primary')?.click()`
+        )
+        await wait(1200)
+        const saved = fs.readFileSync(textFile, 'utf-8')
+        checks.push(['保存写回磁盘', saved.includes('patched by smoke'), JSON.stringify(saved.slice(-24))])
+        st = await editorState()
+        checks.push(['保存后弹窗仍开着', st?.open === true, ''])
+        checks.push(['保存后脏标记清掉', st?.dirty === false, ''])
+
+        const closeHit = await js(
+          `(() => {
+            const btn = [...document.querySelectorAll('.edit-dialog .el-button')]
+              .find((b) => b.textContent.includes('关闭'))
+            if (!btn) return 'no-btn'
+            btn.click()
+            return 'ok'
+          })()`
+        )
+        // 弹窗有淡出动画，关掉之后 DOM 还会留一小会儿；轮询到它真消失再断言
+        let closedOk = false
+        for (let i = 0; i < 20; i++) {
+          const state = await editorState()
+          if (state === null || state.open === false) {
+            closedOk = true
+            break
+          }
+          await wait(100)
+        }
+        if (!closedOk) {
+          const dump = await js(`(() => {
+            const box = document.querySelector('.el-message-box')
+            const dlg = document.querySelector('.edit-dialog')
+            return JSON.stringify({
+              box: box ? box.textContent.trim().slice(0, 40) : '',
+              dialog: dlg ? dlg.className : 'gone',
+              overlay: dlg?.closest('.el-overlay') ? getComputedStyle(dlg.closest('.el-overlay')).display : ''
+            })
+          })()`)
+          console.log(`[smoke] 关闭失败诊断: hit=${closeHit} ${dump}`)
+        }
+        checks.push(['关闭编辑器', closedOk, ''])
+
+        // ---------- 二进制：右键没有「在编辑器中打开」，直接读也会被主进程挡掉 ----------
+        const rightClickRow = (name: string) =>
+          js(`(() => {
+            const rows = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.rows .row') || []
+            const row = [...rows].find((r) => r.textContent.includes(${JSON.stringify(name)}))
+            if (!row) return 'no-row'
+            const r = row.getBoundingClientRect()
+            row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 20, clientY: r.top + 8 }))
+            return 'ok'
+          })()`)
+
+        const menuText = () =>
+          js(`JSON.stringify([...document.querySelectorAll('.ctx-menu .ctx-item')].map((e) => e.textContent.trim()))`)
+
+        await rightClickRow('conf.txt')
+        await wait(400)
+        checks.push(['文本文件有「在编辑器中打开」', String(await menuText()).includes('在编辑器中打开'), ''])
+        await js(`document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+        await wait(200)
+
+        await rightClickRow('blob.bin')
+        await wait(400)
+        const binMenu = await menuText()
+        checks.push(['二进制文件不给「编辑器打开」', !String(binMenu).includes('在编辑器中打开'), String(binMenu).slice(0, 60)])
+        // 文件右键菜单是监听 mousedown(capture) 关的，派发 click 关不掉，别搞错事件类型
+        await js(`document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+        await wait(200)
+
+        const binRead = await js(
+          `window.api.local.readFile(${JSON.stringify(binFile)}).then(() => 'read-ok').catch((e) => String(e.message || e))`
+        )
+        checks.push(['主进程挡住二进制', String(binRead).includes('文本文件'), String(binRead).slice(0, 40)])
+
+        // ---------- 远程：双击 /etc/hosts → 编辑器 ----------
+        await goto(1, '/etc')
+        await wait(1600)
+        const openRemote = await dblclickRow(1, 'hosts')
+        await wait(1000)
+        st = await editorState()
+        checks.push(['双击远程文本文件', openRemote === 'ok' && !!st, openRemote])
+        checks.push(['弹窗标为「远程」', st?.badge === '远程', st?.badge || '无'])
+        checks.push(['远程内容非空', (st?.value || '').length > 0, `${(st?.value || '').length} 字符`])
+        checks.push(['远程未改动时保存禁用', st?.saveDisabled === true, ''])
+        await wait(300)
+        await shot('thshell-editor.png')
+
+        /* 窗口态：编辑器正文是 CodeMirror，"最大化"必须真的把编辑器拉高 ——
+           只是外壳变大、里面还是 58vh 的话，这功能等于没做（图片预览那边踩过一次） */
+        const readBox = `(() => {
+          const dlg = document.querySelector('.edit-dialog')
+          if (!dlg) return null
+          const r = dlg.getBoundingClientRect()
+          const cm = dlg.querySelector('.cm-editor')
+          const body = dlg.querySelector('.el-dialog__body')
+          return {
+            vh: window.innerHeight,
+            h: Math.round(r.height),
+            bottom: Math.round(r.bottom),
+            cmH: cm ? Math.round(cm.getBoundingClientRect().height) : 0,
+            bodyShown: !!body && getComputedStyle(body).display !== 'none',
+            lines: dlg.querySelectorAll('.cm-line').length,
+            btns: dlg.querySelectorAll('.win-ctl .wc').length
+          }
+        })()`
+        type EditBox = {
+          vh: number
+          h: number
+          bottom: number
+          cmH: number
+          bodyShown: boolean
+          lines: number
+          btns: number
+        }
+        const clickEditWin = (title: string) =>
+          js(
+            `[...document.querySelectorAll('.edit-dialog .win-ctl .wc')].find((b) => (b.getAttribute('title') || '').startsWith(${JSON.stringify(
+              title
+            )}))?.click()`
+          )
+
+        const eb0 = (await js(readBox)) as EditBox | null
+        checks.push(['编辑器标题栏也有三颗窗口按钮', eb0?.btns === 3, `${eb0?.btns} 颗`])
+
+        await clickEditWin('最大化')
+        await wait(600)
+        const ebMax = (await js(readBox)) as EditBox | null
+        checks.push([
+          '编辑器最大化后外壳铺满',
+          !!ebMax && !!eb0 && ebMax.h > eb0.h + 40,
+          `${eb0?.h} → ${ebMax?.h}px`
+        ])
+        checks.push([
+          '最大化后编辑器本体跟着长高',
+          !!ebMax && !!eb0 && ebMax.cmH > eb0.cmH + 60,
+          `${eb0?.cmH} → ${ebMax?.cmH}px`
+        ])
+        checks.push(['最大化后底边没出屏', !!ebMax && ebMax.bottom <= ebMax.vh, `底边 ${ebMax?.bottom} / ${ebMax?.vh}`])
+
+        await clickEditWin('最小化')
+        await wait(500)
+        const ebMin = (await js(readBox)) as EditBox | null
+        checks.push([
+          '编辑器最小化也收成一条',
+          !!ebMin && ebMin.h <= 44 && !ebMin.bodyShown,
+          `高 ${ebMin?.h}px`
+        ])
+
+        await js(`document.querySelector('.edit-dialog .edit-head.min')?.click()`)
+        await wait(500)
+        const ebBack = (await js(readBox)) as EditBox | null
+        checks.push([
+          '展开回来编辑器内容还在（没被销毁重建）',
+          !!ebBack && !!eb0 && ebBack.h > 200 && ebBack.bodyShown && ebBack.lines === eb0.lines,
+          `高 ${ebBack?.h}px，${ebBack?.lines} 行`
+        ])
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`)
+        }
+        console.log(`[smoke] edit ${failed ? failed + ' 项失败' : '全部通过'}`)
+
+        fs.rmSync(dir, { recursive: true, force: true })
+        finish()
+        return
+      }
+
+      // text 模式：文本编码的读写往返。
+      // 起因是"Windows 上的 .ini 打不开"：UTF-16 文件的 ASCII 部分每隔一个字节就是 0x00，
+      // 被 looksBinary 当成二进制挡掉了。这里按字节验，别只验"能打开"——
+      // 保存时写错编码等于把文件写坏，比打不开更糟。
+      if (mode === 'text') {
+        await wait(1200)
+
+        const dir = path.join(os.tmpdir(), 'thshell-text-smoke')
+        fs.rmSync(dir, { recursive: true, force: true })
+        fs.mkdirSync(dir, { recursive: true })
+
+        const cjk = '[server]\n端口 = 8080\n名称 = 测试机\n'
+        const winIni = path.join(dir, 'win.ini')
+        const plainIni = path.join(dir, 'plain.ini')
+        const bom8Ini = path.join(dir, 'bom8.ini')
+        const noBom16 = path.join(dir, 'nobom.ini')
+        const blobIni = path.join(dir, 'blob.ini')
+
+        // UTF-16 LE + BOM：记事本"Unicode"另存出来的 .ini 就长这样
+        fs.writeFileSync(winIni, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(cjk, 'utf16le')]))
+        fs.writeFileSync(plainIni, cjk, 'utf-8')
+        fs.writeFileSync(bom8Ini, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(cjk, 'utf-8')]))
+        // 不带 BOM 的 UTF-16：我们不猜，仍按二进制挡下（记录这条边界）
+        fs.writeFileSync(noBom16, Buffer.from(cjk, 'utf16le'))
+        // 扩展名叫 .ini 但内容是二进制：白名单放行 ≠ 内容放行
+        fs.writeFileSync(blobIni, Buffer.from([0x00, 0x01, 0x02, 0x50, 0x4b, 0x00, 0x00]))
+
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+        const tryRead = (p: string) => {
+          try {
+            return readLocalFile(p)
+          } catch (err) {
+            return { content: `__throw__${(err as Error).message}`, encoding: 'utf-8', bom: false } as any
+          }
+        }
+
+        const w = tryRead(winIni)
+        push('UTF-16 ini 能读出来', w.content === cjk, w.content.startsWith('__throw__') ? w.content : '')
+        push('识别为 utf-16le', w.encoding === 'utf-16le', w.encoding)
+        push('记下了 BOM', w.bom === true, `${w.bom}`)
+
+        // 原编码写回：多加一行，再按字节核
+        writeLocalFile(winIni, cjk + '刚才改过 = 是\n', 'utf-16le', true)
+        const back = fs.readFileSync(winIni)
+        push(
+          '写回仍是 UTF-16LE + BOM',
+          back[0] === 0xff && back[1] === 0xfe && back.subarray(2).toString('utf16le') === cjk + '刚才改过 = 是\n',
+          `头两字节 ${back[0]?.toString(16)} ${back[1]?.toString(16)}`
+        )
+        // 关键：不能混进 UTF-8 的字节序列，否则读它的老程序整份乱码
+        push('没写成 UTF-8', !back.includes(Buffer.from('端口', 'utf-8')), '')
+
+        const b8 = tryRead(bom8Ini)
+        push('UTF-8 BOM 去掉了', b8.content === cjk && b8.bom === true, `${b8.bom}`)
+        writeLocalFile(bom8Ini, cjk, 'utf-8', true)
+        const b8back = fs.readFileSync(bom8Ini)
+        push(
+          'UTF-8 BOM 写回时补回',
+          b8back[0] === 0xef && b8back[1] === 0xbb && b8back[2] === 0xbf,
+          b8back.subarray(0, 3).toString('hex')
+        )
+
+        const pl = tryRead(plainIni)
+        push('普通 UTF-8 照常', pl.content === cjk && pl.bom === false && pl.encoding === 'utf-8', pl.encoding)
+        writeLocalFile(plainIni, 'x = 1\n')
+        push('默认写回不带 BOM', fs.readFileSync(plainIni)[0] === 0x78, '')
+
+        const blob = tryRead(blobIni)
+        push('真二进制仍被挡住', blob.content.startsWith('__throw__') && blob.content.includes('文本文件'), blob.content.slice(0, 24))
+        const nb = tryRead(noBom16)
+        push(
+          '无 BOM 的 UTF-16 仍判二进制',
+          nb.content.startsWith('__throw__') && nb.content.includes('文本文件'),
+          '宁可打不开也不猜错编码'
+        )
+
+        // ---------- 体积上限：旧上限是 5MB，现在放到 20MB ----------
+        // 6MB 正好卡在"以前打不开、现在能打开"的区间，拿它当判据最直接。
+        // 用 .txt 不用 .log：.log 现在双击走只读日志查看器（那条链路由 log 模式单独验），
+        // 这里要验的是"大号普通文本挂在 CodeMirror 里到底卡不卡"。
+        const bigLog = path.join(dir, 'big.txt')
+        const hugeLog = path.join(dir, 'huge.txt')
+        fs.writeFileSync(bigLog, 'line of log content 0123456789 abcdef\n'.repeat(160000))
+        fs.writeFileSync(hugeLog, Buffer.alloc(25 * 1024 * 1024, 0x41))
+        const bigStat = fs.statSync(bigLog).size
+        const bigRead = tryRead(bigLog)
+        push(
+          `6MB（${Math.round(bigStat / 1024 / 1024)}MB）能读`,
+          !bigRead.content.startsWith('__throw__') && bigRead.content.length > 5 * 1024 * 1024,
+          `${bigRead.content.length} 字符`
+        )
+        const huge = tryRead(hugeLog)
+        push(
+          '超 20MB 仍拒绝',
+          huge.content.startsWith('__throw__') && huge.content.includes('20MB'),
+          huge.content.replace('__throw__', '').slice(0, 30)
+        )
+
+        // ---------- 界面上真的双击一次 .ini ----------
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        await wait(5000)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(1800)
+        await js(`(() => {
+          const el = document.querySelectorAll('.fm .pane')[0]?.querySelector('.path-input')
+          if (!el) return 'no-input'
+          el.value = ${JSON.stringify(dir)}
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1000)
+        const hit = await js(`(() => {
+          const rows = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.rows .row') || []
+          const row = [...rows].find((r) => r.textContent.includes('win.ini'))
+          if (!row) return 'no-row'
+          row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1400)
+        const ui = (await js(`(() => {
+          const dlg = document.querySelector('.edit-dialog')
+          if (!dlg) return { open: false }
+          const overlay = dlg.closest('.el-overlay') || dlg
+          const text = [...dlg.querySelectorAll('.cm-line')].map((l) => l.textContent).join('\\n')
+          return {
+            open: getComputedStyle(overlay).display !== 'none' && overlay.getBoundingClientRect().height > 0,
+            enc: dlg.querySelector('.edit-enc')?.textContent.trim() || '',
+            text
+          }
+        })()`)) as { open: boolean; enc?: string; text?: string }
+        push('双击 .ini 打开编辑器', hit === 'ok' && ui.open === true, hit)
+        push('界面标出 UTF-16 LE', ui.enc === 'UTF-16 LE', ui.enc || '没有编码标记')
+        push('编辑器内容解码正确', (ui.text || '').includes('端口 = 8080'), (ui.text || '').slice(0, 20))
+        await wait(300)
+        await shot('thshell-text-utf16.png')
+
+        // ---------- 6MB 的文件在界面里到底卡不卡 ----------
+        // 放不放开上限不能只凭"能读"，要看真挂进 CodeMirror 要多久
+        await js(`(() => {
+          const btn = [...document.querySelectorAll('.edit-dialog .el-button')].find((b) => b.textContent.includes('关闭'))
+          btn?.click()
+        })()`)
+        await wait(800)
+        const t0 = Date.now()
+        const bigHit = await js(`(() => {
+          const rows = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.rows .row') || []
+          const row = [...rows].find((r) => r.textContent.includes('big.txt'))
+          if (!row) return 'no-row'
+          row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+          return 'ok'
+        })()`)
+        let rendered = 0
+        for (let i = 0; i < 40 && !rendered; i += 1) {
+          await wait(250)
+          rendered = (await js(`document.querySelectorAll('.edit-dialog .cm-line').length`)) as number
+        }
+        const cost = Date.now() - t0
+        push('6MB 文件能挂进编辑器', bigHit === 'ok' && rendered > 0, `${rendered} 行已渲染`)
+        push('打开耗时在可接受范围', cost < 8000, `${cost}ms`)
+        await wait(300)
+        await shot('thshell-text-big.png')
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        console.log(`[smoke] text ${failed ? failed + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+
+        fs.rmSync(dir, { recursive: true, force: true })
+        finish()
+        return
+      }
+
+      // log 模式：日志"只看末尾 N 行"这条链路。
+      // 重点不是"能不能读"，而是：几百 MB 的日志能不能秒开、给的是不是**最后**那么多行、
+      // 界面上到底有没有编辑入口（用户明确说日志不需要改）。
+      if (mode === 'log') {
+        await wait(1200)
+
+        const dir = path.join(os.tmpdir(), 'thshell-log-smoke')
+        fs.rmSync(dir, { recursive: true, force: true })
+        fs.mkdirSync(dir, { recursive: true })
+
+        const many = path.join(dir, 'many.log')
+        const short = path.join(dir, 'short.log')
+        const u16 = path.join(dir, 'u16.log')
+        const fake = path.join(dir, 'fake.log')
+        const huge = path.join(dir, 'huge.log')
+
+        const row = (n: number) => `2026-11-10 10:00:00 INFO 第 ${n} 行 请求完成`
+        fs.writeFileSync(many, Array.from({ length: 10000 }, (_, i) => row(i + 1)).join('\n') + '\n')
+        fs.writeFileSync(short, Array.from({ length: 50 }, (_, i) => row(i + 1)).join('\n') + '\n')
+        // UTF-16LE + BOM 的日志：尾巴上没有 BOM，编码只能从文件头嗅
+        fs.writeFileSync(
+          u16,
+          Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(Array.from({ length: 300 }, (_, i) => row(i + 1)).join('\r\n'), 'utf16le')])
+        )
+        // 扩展名叫 .log 的二进制：白名单放行 ≠ 内容放行
+        fs.writeFileSync(fake, Buffer.from([0x1f, 0x8b, 0x00, 0x00, 0x50, 0x4b, 0x00, 0x00]))
+        // 40MB：这个体积正是"整份读必卡"的量级
+        {
+          const fd = fs.openSync(huge, 'w')
+          const block = Buffer.from('2026-11-10 10:00:00 INFO 这是一条很长的访问日志 xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n'.repeat(500))
+          for (let i = 0; i < 2200; i += 1) fs.writeSync(fd, block)
+          fs.writeSync(fd, Buffer.from('TAIL-MARKER-9527\n'))
+          fs.closeSync(fd)
+        }
+
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+        const tail = async (p: string, n?: number) => {
+          try {
+            return await readLocalTail(p, n)
+          } catch (err) {
+            return { content: `__throw__${(err as Error).message}`, lines: -1, size: 0, truncated: false, encoding: 'utf-8' as const }
+          }
+        }
+        const firstOf = (t: string) => t.split('\n')[0]
+        const lastOf = (t: string) => t.split('\n').filter((l) => l !== '').pop() || ''
+
+        // ---------- 默认 200 行，且必须是「最后」200 行 ----------
+        const t200 = await tail(many)
+        push('默认给 200 行', t200.lines === 200, `${t200.lines} 行`)
+        push('是文件最后的 200 行', lastOf(t200.content).includes('第 10000 行'), lastOf(t200.content).slice(-16))
+        push('第一行是第 9801 行（10000-200+1）', firstOf(t200.content).includes('第 9801 行'), firstOf(t200.content).slice(-16))
+        push('标出前面还有内容', t200.truncated === true, `${t200.truncated}`)
+        push('文件大小没读错', t200.size === fs.statSync(many).size, `${t200.size}`)
+
+        // ---------- 行数可调 ----------
+        const t500 = await tail(many, 500)
+        push('改成 500 行就真给 500 行', t500.lines === 500, `${t500.lines} 行`)
+        push('500 行的起点也对', firstOf(t500.content).includes('第 9501 行'), firstOf(t500.content).slice(-16))
+        const t20 = await tail(many, 20)
+        push('小于 50 的行数被夹到 50', t20.lines === 50, `${t20.lines} 行`)
+
+        // ---------- 比请求短的文件：全给，且不谎称"前面还有" ----------
+        const tShort = await tail(short, 500)
+        push('短文件全给', tShort.lines === 50, `${tShort.lines} 行`)
+        push('短文件不标截断', tShort.truncated === false, `${tShort.truncated}`)
+
+        // ---------- UTF-16 日志的尾巴 ----------
+        const t16 = await tail(u16)
+        push('UTF-16 日志识别正确', t16.encoding === 'utf-16le', t16.encoding)
+        push('UTF-16 尾巴解码正确', lastOf(t16.content).includes('第 300 行'), lastOf(t16.content).slice(-14))
+
+        // ---------- 二进制护栏 ----------
+        const tFake = await tail(fake)
+        push(
+          '名字叫 .log 的二进制被挡住',
+          tFake.content.startsWith('__throw__') && tFake.content.includes('文本文件'),
+          tFake.content.replace('__throw__', '').slice(0, 24)
+        )
+
+        // ---------- 40MB：这才是日志查看器存在的理由 ----------
+        const hugeSize = fs.statSync(huge).size
+        const h0 = Date.now()
+        const tHuge = await tail(huge)
+        const hugeCost = Date.now() - h0
+        push(`大日志（${Math.round(hugeSize / 1024 / 1024)}MB）能读`, tHuge.lines === 200, `${tHuge.lines} 行`)
+        push('读到的是真末尾', lastOf(tHuge.content).includes('TAIL-MARKER-9527'), lastOf(tHuge.content))
+        // 整份读进来要几十 MB 内存 + 解码 + 挂进 CodeMirror；只读尾部只有几十 KB
+        push('大文件读尾部 < 1s', hugeCost < 1000, `${hugeCost}ms`)
+        let wholeCost = 0
+        {
+          const w0 = Date.now()
+          fs.readFileSync(huge)
+          wholeCost = Date.now() - w0
+        }
+        push('比整份读快得多', hugeCost < wholeCost, `尾部 ${hugeCost}ms vs 整份 ${wholeCost}ms`)
+
+        // ---------- 界面：双击 .log 应该进"只读日志查看器" ----------
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        await wait(4000)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(1800)
+        await js(`(() => {
+          const el = document.querySelectorAll('.fm .pane')[0]?.querySelector('.path-input')
+          if (!el) return 'no-input'
+          el.value = ${JSON.stringify(dir)}
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1000)
+        const hit = await js(`(() => {
+          const rows = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.rows .row') || []
+          const row = [...rows].find((r) => r.textContent.includes('many.log'))
+          if (!row) return 'no-row'
+          row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1600)
+
+        const readDlg = () =>
+          js(`(() => {
+            const dlg = document.querySelector('.log-dialog')
+            if (!dlg) return { open: false }
+            const overlay = dlg.closest('.el-overlay') || dlg
+            const lines = [...dlg.querySelectorAll('.cm-line')].map((l) => l.textContent)
+            const scroller = dlg.querySelector('.cm-scroller')
+            const content = dlg.querySelector('.cm-content')
+            return {
+              open: getComputedStyle(overlay).display !== 'none' && overlay.getBoundingClientRect().height > 0,
+              meta: dlg.querySelector('.log-meta')?.textContent.trim() || '',
+              tag: dlg.querySelector('.log-tag')?.textContent.trim() || '',
+              cut: dlg.querySelector('.log-cut')?.textContent.trim() || '',
+              saveBtn: [...dlg.querySelectorAll('.el-button')].some((b) => b.textContent.includes('保存')),
+              editable: content?.getAttribute('contenteditable') ?? 'missing',
+              last: lines.filter((l) => l && l.trim()).pop() || '',
+              lineCount: lines.length,
+              gutter: !!dlg.querySelector('.cm-gutter'),
+              atBottom: scroller ? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40 : false,
+              // 编辑器弹窗不该被打开
+              editorOpen: !!document.querySelector('.edit-dialog')
+            }
+          })()`)
+
+        let ui = (await readDlg()) as Record<string, any>
+        // 滚动这条要留出测量的时间：弹窗刚挂上时 CodeMirror 的 scrollHeight 还在长，
+        // 差值和阈值只差几像素就会偶发假失败（内容其实已经到底了）。
+        // 最多轮询 2.5 秒，一旦到底立刻停 —— 只重试一次是不够的，日志是边读边渲染的。
+        for (let i = 0; i < 5 && ui.atBottom !== true; i += 1) {
+          await wait(500)
+          ui = { ...ui, ...((await readDlg()) as Record<string, any>) }
+        }
+        push('双击 .log 打开日志查看器', hit === 'ok' && ui.open === true, hit)
+        push('走的是日志弹窗，不是编辑器', ui.editorOpen === false, ui.editorOpen ? '编辑弹窗也开了' : '')
+        push('标了「日志 · 只读」', ui.tag === '日志 · 只读', ui.tag || '没有标记')
+        push('底栏显示末尾 200 行', ui.meta.includes('末尾 200 行'), ui.meta)
+        push('标出前面还有内容', ui.cut.includes('前面还有'), ui.cut || '没有提示')
+        push('没有保存按钮', ui.saveBtn === false, ui.saveBtn ? '有保存按钮' : '')
+        push('编辑器是真只读', ui.editable === 'false', `contenteditable=${ui.editable}`)
+        // 行号从 1 开始数会让人以为那是文件真实行号（第 477 行其实是第 9977 行），日志里不要它
+        push('日志不显示行号', ui.gutter === false, ui.gutter ? '还挂着行号栏' : '')
+        push('打开就停在最新一行', ui.atBottom === true, `已渲染 ${ui.lineCount} 行，last=${String(ui.last).slice(-18)}`)
+
+        // ---------- 行数可调 ----------
+        await js(`document.querySelector('.log-dialog .log-pick .el-select__wrapper')?.click()`)
+        await wait(600)
+        await js(`(() => {
+          const items = [...document.querySelectorAll('.el-select-dropdown__item')]
+          const it = items.find((el) => el.textContent.trim() === '500 行')
+          if (!it) return 'no-item'
+          it.click()
+          return 'ok'
+        })()`)
+        await wait(1400)
+        ui = (await readDlg()) as Record<string, any>
+        push('切到 500 行后底栏跟着变', ui.meta.includes('末尾 500 行'), ui.meta)
+
+        // ---------- 实时：往文件里追加一行，自动刷新要能看见 ----------
+        // 这一条才是"实时读取"的真正含义 —— 不是打开时读一次就完了
+        await js(`document.querySelector('.log-dialog .log-bar .el-checkbox')?.click()`)
+        await wait(400)
+        fs.appendFileSync(many, '2026-11-10 10:30:00 ERROR 刚刚写进去的一行\n')
+        await wait(4500)
+        ui = (await readDlg()) as Record<string, any>
+        push('自动刷新读到了新写入的行', String(ui.last).includes('刚刚写进去的一行'), String(ui.last).slice(-22))
+
+        // ---------- 远程链路：SFTP 的 open / 定位 read / close 也要过一遍 ----------
+        // 本地的 loop 好验，远程那套"读不满要再往前翻倍"最容易出错，得真连一台机器读
+        const remote = (await js(`(async () => {
+          const sid = window.__store?.tabs.find((t) => t.sessionId)?.sessionId || ''
+          if (!sid) return { skip: true }
+          const cands = [
+            // 真日志优先：几百 KB 以上，能逼出"一个窗口不够、要往前翻倍再读"那条路
+            { p: '/var/log/messages', n: 1000, end: '' },
+            { p: '/etc/ssl/certs/ca-certificates.crt', n: 2000, end: '-----END CERTIFICATE-----' },
+            { p: '/etc/services', n: 200, end: '' },
+            { p: '/etc/hosts', n: 50, end: '' }
+          ]
+          for (const c of cands) {
+            try {
+              const r = await window.api.sftp.readTail(sid, c.p, c.n)
+              const rows = r.content.split('\\n')
+              return {
+                skip: false, path: c.p, end: c.end,
+                lines: r.lines, truncated: r.truncated, size: r.size,
+                tail: rows[rows.length - 1],
+                bad: r.content.includes('\\uFFFD')
+              }
+            } catch (e) { /* 换下一个候选文件 */ }
+          }
+          return { skip: false, error: '所有候选文件都读不了' }
+        })()`)) as Record<string, any>
+        if (remote.skip) {
+          console.log('[smoke] SKIP 远程尾部：当前没有可用的 SSH 会话')
+        } else {
+          push('远程也能读尾部', !remote.error && remote.lines > 0, remote.path || remote.error || '')
+          // 切片从文件中途开始，起点落在半个汉字里就会出 U+FFFD —— 这条最容易被忽略
+          push('远程尾部没有乱码', remote.bad === false, remote.bad ? '出现了 U+FFFD' : '')
+          push(
+            '远程读到的是真末尾',
+            !remote.end || String(remote.tail).includes(remote.end),
+            String(remote.tail || '').slice(-24)
+          )
+        }
+
+        await wait(300)
+        await shot('thshell-log.png')
+
+        /* 日志弹窗是三段结构（路径行 + 工具条 + 编辑器），最大化最容易在这里翻车：
+           工具条被 flex 压扁 / 编辑器没跟着长高 */
+        const readLogBox = `(() => {
+          const dlg = document.querySelector('.log-dialog')
+          if (!dlg) return null
+          const r = dlg.getBoundingClientRect()
+          const cm = dlg.querySelector('.cm-editor')
+          const bar = dlg.querySelector('.log-bar')
+          const pick = dlg.querySelector('.log-pick')
+          return {
+            vh: window.innerHeight,
+            h: Math.round(r.height),
+            bottom: Math.round(r.bottom),
+            cmH: cm ? Math.round(cm.getBoundingClientRect().height) : 0,
+            barH: bar ? Math.round(bar.getBoundingClientRect().height) : 0,
+            pickH: pick ? Math.round(pick.getBoundingClientRect().height) : 0
+          }
+        })()`
+        type LogBox = { vh: number; h: number; bottom: number; cmH: number; barH: number; pickH: number }
+        const lb0 = (await js(readLogBox)) as LogBox | null
+        await js(
+          `[...document.querySelectorAll('.log-dialog .win-ctl .wc')].find((b) => (b.getAttribute('title') || '').startsWith('最大化'))?.click()`
+        )
+        await wait(600)
+        const lbMax = (await js(readLogBox)) as LogBox | null
+        push(
+          '日志弹窗最大化后编辑器跟着长高',
+          !!lbMax && !!lb0 && lbMax.cmH > lb0.cmH + 60 && lbMax.bottom <= lbMax.vh,
+          `${lb0?.cmH} → ${lbMax?.cmH}px，底边 ${lbMax?.bottom}/${lbMax?.vh}`
+        )
+        // 工具条里的 select 只有 24px 高，被压一下就只剩半个
+        push(
+          '最大化后工具条没被压扁',
+          !!lbMax && !!lb0 && lbMax.barH >= lb0.barH && lbMax.pickH >= 20,
+          `条高 ${lb0?.barH} → ${lbMax?.barH}px`
+        )
+        await shot('thshell-log-max.png')
+        // 还原回原尺寸：后面还要用底栏的「关闭」走一遍正常关窗
+        await js(
+          `[...document.querySelectorAll('.log-dialog .win-ctl .wc')].find((b) => (b.getAttribute('title') || '').startsWith('还原'))?.click()`
+        )
+        await wait(400)
+        const lbBack = (await js(readLogBox)) as LogBox | null
+        push(
+          '点还原能回到原来的尺寸',
+          !!lbBack && !!lb0 && Math.abs(lbBack.h - lb0.h) <= 4,
+          `${lbMax?.h} → ${lbBack?.h}px（原 ${lb0?.h}）`
+        )
+
+        // ---------- 底栏图标语义：眼睛=看、笔=改，重命名不能再抢那支笔 ----------
+        // 关掉弹窗，选中 many.log，然后看底栏第 4 个按钮（打开）是不是换成了「查看日志」
+        await js(`(() => {
+          const b = [...document.querySelectorAll('.log-dialog .el-button')].find((x) => x.textContent.includes('关闭'))
+          b?.click()
+        })()`)
+        await wait(700)
+        await js(`(() => {
+          const rows = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.rows .row') || []
+          const row = [...rows].find((r) => r.textContent.includes('many.log'))
+          row?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(400)
+        const foot = (await js(`(() => {
+          const p = document.querySelectorAll('.fm .pane')[0]
+          if (!p) return { err: 'no-pane' }
+          const btns = [...p.querySelectorAll('.pane-foot .el-button')]
+          const pathOf = (b) => b?.querySelector('svg')?.innerHTML || ''
+          // 0 新建文件夹 / 1 重命名 / 2 删除 / 3 打开
+          return {
+            same: pathOf(btns[3]) === pathOf(btns[1])
+          }
+        })()`)) as Record<string, any>
+        // 图标形状只有"跟重命名不一样"这一条能自动断言，文案靠下一步真悬停
+        push('重命名和打开不是同一个图标', foot.same === false, foot.same ? '两个按钮图形一样' : '')
+        await js(`document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.pane-foot .el-button')[3]?.dispatchEvent(new MouseEvent('mouseenter'))`)
+        let openTip = ''
+        for (let i = 0; i < 8 && !openTip; i += 1) {
+          await wait(300)
+          openTip = ((await js(`(() => {
+            const b = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.pane-foot .el-button')[3]
+            const id = b?.getAttribute('aria-describedby')
+            const tip = id ? document.getElementById(id) : null
+            return tip && getComputedStyle(tip).visibility !== 'hidden' ? tip.textContent.trim() : ''
+          })()`)) as string) || ''
+        }
+        push('选中日志时按钮变成「查看日志」', openTip === '查看日志', openTip || '没有提示')
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        console.log(`[smoke] log ${failed ? failed + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+
+        fs.rmSync(dir, { recursive: true, force: true })
+        finish()
+        return
+      }
+
+      // pdf 模式：PDF 预览。
+      // 这条链路出过"浏览器能打开、我们打不开"的事故 —— 根因是 CSP 里没有 blob:，
+      // pdf.js 的 worker（用 Blob 起的 module worker）被拦掉，回退的 fake worker 也被拦。
+      // 所以要真造一个 PDF、真渲染、真去数画布上的黑像素，不能只看"弹窗开了"。
+      if (mode === 'pdf') {
+        await wait(1500)
+
+        const dir = path.join(os.tmpdir(), 'thshell-pdf-smoke')
+        fs.rmSync(dir, { recursive: true, force: true })
+        fs.mkdirSync(dir, { recursive: true })
+        const pdfPath = path.join(dir, 'demo.pdf')
+
+        /**
+         * 手搓一个最小合法 PDF（1 页 + Helvetica 一行字）。
+         * 依赖库生成太麻烦，而要验的只是"pdf.js 能不能解析并画出来"，
+         * 所以 xref 表自己算偏移 —— 少这一张表 pdf.js 会走"坏 xref 重建"，
+         * 那样验的就不是正常路径了。
+         */
+        {
+          const content = 'BT /F1 18 Tf 40 96 Td (ThShell PDF OK 2026) Tj ET'
+          const bodies = [
+            '<< /Type /Catalog /Pages 2 0 R >>',
+            '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 340 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+            `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+            '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+          ]
+          let out = '%PDF-1.4\n'
+          const offsets: number[] = []
+          bodies.forEach((body, i) => {
+            offsets.push(out.length)
+            out += `${i + 1} 0 obj\n${body}\nendobj\n`
+          })
+          const xrefAt = out.length
+          out += `xref\n0 ${bodies.length + 1}\n0000000000 65535 f \n`
+          for (const off of offsets) out += `${String(off).padStart(10, '0')} 00000 n \n`
+          out += `trailer\n<< /Size ${bodies.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF\n`
+          fs.writeFileSync(pdfPath, Buffer.from(out, 'latin1'))
+        }
+
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+        push('造出来的 PDF 有内容', fs.statSync(pdfPath).size > 400, `${fs.statSync(pdfPath).size} 字节`)
+
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        await wait(4000)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(1800)
+        await js(`(() => {
+          const el = document.querySelectorAll('.fm .pane')[0]?.querySelector('.path-input')
+          if (!el) return 'no-input'
+          el.value = ${JSON.stringify(dir)}
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1000)
+        const hit = await js(`(() => {
+          const rows = document.querySelectorAll('.fm .pane')[0]?.querySelectorAll('.rows .row') || []
+          const row = [...rows].find((r) => r.textContent.includes('demo.pdf'))
+          if (!row) return 'no-row'
+          row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(2200)
+
+        // 渲染是异步的（解析 → 取页 → 画 canvas），轮询到画布出来为止
+        let state = { open: false, alert: '', pages: '', canvases: 0, w: 0, h: 0, dark: 0 }
+        for (let i = 0; i < 24; i += 1) {
+          state = (await js(`(() => {
+            const dlg = document.querySelector('.preview-dialog')
+            if (!dlg) return { open: false, alert: '', pages: '', canvases: 0, w: 0, h: 0, dark: 0 }
+            const overlay = dlg.closest('.el-overlay') || dlg
+            const canvas = dlg.querySelector('.pdf-page canvas')
+            let w = 0, h = 0, dark = 0
+            if (canvas) {
+              w = canvas.width
+              h = canvas.height
+              try {
+                const d = canvas.getContext('2d').getImageData(0, 0, w, h).data
+                // 数"够黑的像素"：文字画上去才会有，空白页是 0
+                for (let k = 0; k < d.length; k += 4) {
+                  if (d[k] < 160 && d[k + 1] < 160 && d[k + 2] < 160) dark += 1
+                }
+              } catch (e) { dark = -1 }
+            }
+            return {
+              open: getComputedStyle(overlay).display !== 'none' && overlay.getBoundingClientRect().height > 0,
+              alert: dlg.querySelector('.pdf-alert')?.textContent?.trim() || '',
+              pages: dlg.querySelector('.pdf-pages')?.textContent?.trim() || '',
+              canvases: dlg.querySelectorAll('.pdf-page canvas').length,
+              w, h, dark
+            }
+          })()`)) as typeof state
+          // 「有画布」和「画布上有字」不是同一时刻：canvas 挂上去之后才真正往上画，
+          // 所以两个条件都满足才停，否则会把"还没画完"当成"白板"
+          if ((state.canvases > 0 && state.dark > 100) || state.alert) break
+          await wait(300)
+        }
+
+        push('双击 PDF 打开了预览', hit === 'ok' && state.open === true, hit)
+        // 这条就是用户看到的那句 "Setting up fake worker failed…"，现在是零容忍
+        push('没有报错提示', !state.alert, state.alert.slice(0, 90))
+        push('读出了页数', state.pages.includes('1 页'), state.pages || '没显示页数')
+        push('画布渲染出来了', state.canvases > 0, `${state.canvases} 个 canvas`)
+        push('画布尺寸正常', state.w > 0 && state.h > 0, `${state.w}×${state.h}`)
+        push('画布上真有内容（不是白板）', state.dark > 100, `深色像素 ${state.dark}`)
+
+        await wait(300)
+        await shot('thshell-pdf.png')
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        console.log(`[smoke] pdf ${failed ? failed + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+
+        fs.rmSync(dir, { recursive: true, force: true })
+        finish()
+        return
+      }
+
+      /**
+       * files 模式：文件类型图标 + 图片预览。
+       *
+       * 图标这种"一列 16px 小图形"的东西，截图看十遍也只能说"好像不一样"，
+       * 所以这里直接读每一行图标的 class（`k-image` / `k-archive` …）逐项断言。
+       * 图片预览则要真解一次：造一张 24×24 的真 PNG（自算 zlib + CRC），
+       * 断言 naturalWidth 和缩放按钮，最后截图目检。
+       */
+      if (mode === 'files') {
+        const dir = path.join(os.tmpdir(), 'thshell-files-smoke')
+        fs.rmSync(dir, { recursive: true, force: true })
+        fs.mkdirSync(dir, { recursive: true })
+
+        // 24×24，左上红块 / 右下蓝块 / 其余青绿，101 字节
+        const PNG = Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAALElEQVR42mP4b2ODFcntW0ASYhg1' +
+            'aEQbRKqGUYNGDaKGQRo9/7GiUYNGtEEApCRjru8t4yEAAAAASUVORK5CYII=',
+          'base64'
+        )
+
+        /** [文件名, 内容, 期望的图标种类] */
+        const files: [string, string | Buffer, string][] = [
+          ['shot.png', PNG, 'image'],
+          ['icon.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"/>\n', 'image'],
+          ['notes.md', '# 说明\n', 'text'],
+          ['app.py', 'print(1)\n', 'code'],
+          ['Main.java', 'class A {}\n', 'code'],
+          ['config.yml', 'a: 1\n', 'config'],
+          ['access.log', '2026-11-10 10:00:00 ok\n', 'log'],
+          ['backup.zip', 'PK', 'archive'],
+          ['photo.tar.gz', 'gz', 'archive'],
+          ['movie.mp4', 'mp4', 'video'],
+          ['song.mp3', 'ID3', 'audio'],
+          ['report.docx', 'PK', 'doc'],
+          ['sheet.xlsx', 'PK', 'sheet'],
+          ['slides.pptx', 'PK', 'slide'],
+          ['manual.pdf', '%PDF-1.4\n', 'pdf'],
+          ['tool.exe', 'MZ', 'exe'],
+          ['server.pem', '-----BEGIN-----\n', 'key'],
+          ['app.db', 'SQLite', 'db'],
+          ['blob.dat', 'x', 'other'],
+          ['README', 'readme\n', 'text']
+        ]
+        for (const [name, content] of files) {
+          fs.writeFileSync(path.join(dir, name), content as string | Buffer)
+        }
+
+        await wait(1500)
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+
+        /**
+         * 建连那几秒面板全是空的，页签图标得转起来，否则用户看不出是在连还是点错了。
+         * SSH 握手通常 200ms 起步，这里 20ms 一采，抓得到。
+         */
+        const spinning = (await js(`(async () => {
+          const seen = new Set()
+          for (let i = 0; i < 80; i++) {
+            document.querySelectorAll('.seg-btn').forEach((b) => {
+              if (b.querySelector('.el-icon.spin')) seen.add((b.textContent || '').trim())
+            })
+            if (seen.size >= 4) break
+            await new Promise((r) => setTimeout(r, 20))
+          }
+          return [...seen]
+        })()`)) as string[]
+
+        await shot('files-seg-busy.png')
+        await wait(3500)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(1800)
+        await js(`(() => {
+          const el = document.querySelectorAll('.fm .pane')[0]?.querySelector('.path-input')
+          if (!el) return 'no-input'
+          el.value = ${JSON.stringify(dir)}
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1200)
+
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        push('连接中页签图标转圈', spinning.length >= 4, spinning.join('/'))
+        // 数据到位后要停，不然一排永远不会停的圈比不转还糟
+        const stillSpin = (await js(`(() => {
+          const b = [...document.querySelectorAll('.seg-btn')].find((x) =>
+            (x.textContent || '').includes('文件')
+          )
+          return !!b?.querySelector('.el-icon.spin')
+        })()`)) as boolean
+        push('加载完文件页签停止转圈', !stillSpin)
+
+        const rows = (await js(`(() => {
+          const pane = document.querySelectorAll('.fm .pane')[0]
+          if (!pane) return []
+          return [...pane.querySelectorAll('.rows .row')].map((r) => ({
+            name: r.querySelector('.fname')?.textContent?.trim() || '',
+            // 图标的种类写在 class 上（k-image / k-archive …），比读 SVG 的 path 稳
+            kind: [...(r.querySelector('.ficon')?.classList || [])]
+              .find((c) => c.startsWith('k-'))?.slice(2) || ''
+          }))
+        })()`)) as { name: string; kind: string }[]
+
+        const wrong: string[] = []
+        for (const [name, , want] of files) {
+          const row = rows.find((r) => r.name === name)
+          if (!row) wrong.push(`${name}(没出现)`)
+          else if (row.kind !== want) wrong.push(`${name}=${row.kind || '无'}（应 ${want}）`)
+        }
+        push('每个文件都用了对应类型的图标', wrong.length === 0, wrong.join('、') || `${rows.length} 行`)
+        push(
+          '图标种类够散（不是一张纸打天下）',
+          new Set(rows.map((r) => r.kind)).size >= 10,
+          `${new Set(rows.map((r) => r.kind)).size} 种`
+        )
+
+        // 先把列表本身截一张（弹窗会盖住左栏），再看预览。
+        // 截图前再点一次「文件」：SSH 掉线后视图会被切回终端，那时截到的是终端页
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(500)
+        await shot('thshell-files.png')
+
+        // 双击真 PNG，看预览面板
+        const hit = await js(`(() => {
+          const pane = document.querySelectorAll('.fm .pane')[0]
+          const row = [...(pane?.querySelectorAll('.rows .row') || [])]
+            .find((r) => r.querySelector('.fname')?.textContent?.trim() === 'shot.png')
+          if (!row) return 'no-row'
+          row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1800)
+
+        const readImg = `(() => {
+          const dlg = document.querySelector('.preview-dialog')
+          if (!dlg) return null
+          const img = dlg.querySelector('.img-el')
+          return {
+            open: true,
+            tag: (dlg.querySelector('.preview-tag')?.textContent || '').trim(),
+            dim: (dlg.querySelector('.img-dim')?.textContent || '').trim(),
+            pct: parseInt((dlg.querySelector('.img-scale')?.textContent || '0'), 10) || 0,
+            natW: img?.naturalWidth || 0,
+            natH: img?.naturalHeight || 0,
+            complete: !!img?.complete,
+            err: (dlg.querySelector('.img-alert')?.textContent || '').trim().slice(0, 80),
+            hasStage: !!dlg.querySelector('.img-scroll')
+          }
+        })()`
+        const img1 = (await js(readImg)) as {
+          open: boolean
+          tag: string
+          dim: string
+          pct: number
+          natW: number
+          natH: number
+          complete: boolean
+          err: string
+          hasStage: boolean
+        } | null
+
+        push('双击图片打开了预览', hit === 'ok' && !!img1?.open, hit)
+        push('是图片预览面板，不是 office 预览', img1?.tag === '图片预览', img1?.tag || '没有标签')
+        push(
+          '图真的解码出来了',
+          img1?.complete === true && img1?.natW === 24 && img1?.natH === 24,
+          `${img1?.natW}×${img1?.natH}`
+        )
+        push('尺寸显示 24 × 24', img1?.dim === '24 × 24', img1?.dim || '空')
+        push('没有报错提示', !img1?.err, img1?.err || '')
+        push('有棋盘格底（能看出透明区域）', img1?.hasStage === true)
+        // 24px 的小图适应窗口时会放大到 4 倍上限，正好能看清像素
+        push('默认按适应窗口放大', !!img1 && img1.pct >= 100 && img1.pct <= 1600, `${img1?.pct}%`)
+
+        await js(
+          `[...document.querySelectorAll('.preview-dialog .img-btn')].find((b) => b.textContent.trim() === '1:1')?.click()`
+        )
+        await wait(400)
+        const pct11 = ((await js(readImg)) as { pct: number } | null)?.pct ?? 0
+        push('切到 1:1 就是 100%', pct11 === 100, `${pct11}%`)
+
+        await js(`document.querySelector('.preview-dialog .img-btn[title="放大"]')?.click()`)
+        await wait(400)
+        const pctZoom = ((await js(readImg)) as { pct: number } | null)?.pct ?? 0
+        push('还能再放大', pctZoom === 110, `${pctZoom}%`)
+
+        /* ---------- 弹窗的窗口态：最大化 / 最小化 / 关闭 ----------
+           一律量几何。"看起来变大了"这种结论截图给不出来，而且缩略图还会骗人。 */
+        const readWin = `(() => {
+          const dlg = document.querySelector('.preview-dialog')
+          if (!dlg) return null
+          const r = dlg.getBoundingClientRect()
+          const body = dlg.querySelector('.el-dialog__body')
+          const stage = dlg.querySelector('.img-scroll')
+          const overlay = dlg.closest('.el-overlay')
+          return {
+            vw: window.innerWidth,
+            vh: window.innerHeight,
+            w: Math.round(r.width),
+            h: Math.round(r.height),
+            bottom: Math.round(r.bottom),
+            bodyShown: !!body && getComputedStyle(body).display !== 'none',
+            stageH: stage ? Math.round(stage.getBoundingClientRect().height) : 0,
+            clickThru: !!overlay && getComputedStyle(overlay).pointerEvents === 'none',
+            btns: [...dlg.querySelectorAll('.win-ctl .wc')].map((b) => b.getAttribute('title'))
+          }
+        })()`
+        type WinBox = {
+          vw: number
+          vh: number
+          w: number
+          h: number
+          bottom: number
+          bodyShown: boolean
+          stageH: number
+          clickThru: boolean
+          btns: string[]
+        }
+
+        const w0 = (await js(readWin)) as WinBox | null
+        push('标题栏有最小化/最大化/关闭三颗按钮', w0?.btns.length === 3, (w0?.btns || []).join(' / '))
+
+        const clickWin = (title: string) =>
+          js(
+            `[...document.querySelectorAll('.preview-dialog .win-ctl .wc')].find((b) => (b.getAttribute('title') || '').startsWith(${JSON.stringify(
+              title
+            )}))?.click()`
+          )
+
+        await clickWin('最大化')
+        await wait(500)
+        const wMax = (await js(readWin)) as WinBox | null
+        push(
+          '最大化铺满了窗口',
+          !!wMax && !!w0 && wMax.w > w0.w && wMax.w >= wMax.vw - 24 && wMax.h >= wMax.vh * 0.9,
+          `${wMax?.w}×${wMax?.h}（窗口 ${wMax?.vw}×${wMax?.vh}，原来 ${w0?.w}×${w0?.h}）`
+        )
+        // 只是外框变大、里面还是 68vh 的话，这功能等于没做
+        push('内容区跟着长高了', !!wMax && !!w0 && wMax.stageH > w0.stageH + 40, `${w0?.stageH} → ${wMax?.stageH}px`)
+        push('最大化后底边没被顶出屏幕', !!wMax && wMax.bottom <= wMax.vh, `底边 ${wMax?.bottom} / ${wMax?.vh}`)
+        await shot('thshell-files-preview-max.png')
+
+        await clickWin('最小化')
+        await wait(500)
+        const wMin = (await js(readWin)) as WinBox | null
+        const minCls = (await js(`!!document.querySelector('.preview-dialog.min')`)) as boolean
+        push(
+          '最小化收成了右下角一条',
+          minCls && !!wMin && wMin.h <= 44 && !wMin.bodyShown,
+          `高 ${wMin?.h}px，正文${wMin?.bodyShown ? '还在' : '已隐藏'}`
+        )
+        // 遮罩不收掉点击的话，小条看着在、后面的文件列表却点不动
+        push('收起后遮罩不再挡着后面的界面', !!wMin && wMin.clickThru === true)
+        await shot('thshell-files-preview-min.png')
+
+        await js(`document.querySelector('.preview-dialog .edit-head.min')?.click()`)
+        await wait(500)
+        const wBack = (await js(readWin)) as WinBox | null
+        const backMin = (await js(`!!document.querySelector('.preview-dialog.min')`)) as boolean
+        push(
+          '点小条能展开回来，内容还在',
+          !backMin && !!wBack && wBack.h > 200 && wBack.bodyShown && wBack.stageH > 40,
+          `高 ${wBack?.h}px，图区 ${wBack?.stageH}px`
+        )
+        // 收起再展开如果重建了组件，缩放会跳回"适应窗口"，这里继续是刚才的 110% 才说明没重来
+        const pctBack = ((await js(readImg)) as { pct: number } | null)?.pct ?? 0
+        push('展开后缩放位置没被重置', pctBack === 110, `${pctBack}%`)
+
+        await shot('thshell-files-preview.png')
+
+        await js(`document.querySelector('.preview-dialog .win-ctl .wc.close')?.click()`)
+        await wait(500)
+        const gone = (await js(`!document.querySelector('.preview-dialog')`)) as boolean
+        push('关闭键真的关掉了', gone)
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        console.log(`[smoke] files ${failed ? failed + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+
+        fs.rmSync(dir, { recursive: true, force: true })
+        finish()
+        return
+      }
+
+      /**
+       * perm 模式：远程列表的「权限」和「用户 / 组」两列。
+       *
+       * 这三段逻辑都是"算错了照样能显示"的：权限串由 mode 位拼、属主从 SFTP 长格式里抠、
+       * 能不能写要拿登录用户的 uid + 全部 gid 去比三档位。所以不靠截图，
+       * 先造一组已知权限的文件，再用三种身份（root / 真身 / 陌生人）各列一遍逐项断言，
+       * 最后才看 DOM 里红字对不对。
+       */
+      if (mode === 'perm') {
+        await wait(1500)
+        const checks: [string, boolean, string][] = []
+        const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
+
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        await wait(5000)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('文件'))?.click()`
+        )
+        await wait(1800)
+
+        const sid = (await js(
+          `window.__store?.tabs.find((t) => t.sessionId)?.sessionId || ''`
+        )) as string
+        const sftp = sid ? await ssh.getSftp(sid) : null
+        if (!sid || !sftp) {
+          console.log('[smoke] SKIP perm：当前没有可用的 SSH 会话')
+          finish()
+          return
+        }
+
+        const who = await ssh.getIdentity(sid)
+        push(
+          '问到了登录用户的 uid 和全部 gid',
+          !!who && who.uid >= 0 && who.gids.length > 0,
+          who ? `uid=${who.uid} gids=${who.gids.join(',')}` : '拿不到'
+        )
+
+        // 已知权限的一组样本：目录 755、子目录 700、文件 644 / 600 / 444。
+        // 用 shell 一步做完：chmod 走 exec 比走 SFTP 少几次往返
+        const dir = '/tmp/thshell-perm-smoke'
+        await ssh.exec(
+          sid,
+          `rm -rf ${dir} && mkdir -p ${dir}/sub && printf a > ${dir}/f644 && printf b > ${dir}/f600 && printf c > ${dir}/f444 && chmod 755 ${dir} && chmod 700 ${dir}/sub && chmod 644 ${dir}/f644 && chmod 600 ${dir}/f600 && chmod 444 ${dir}/f444`
+        )
+
+        const asRoot = await listRemote(sftp, dir, { uid: 0, gids: [0], username: 'root' })
+        const asMe = await listRemote(sftp, dir, who)
+        const asOther = await listRemote(sftp, dir, {
+          uid: 100007,
+          gids: [100007],
+          username: 'smoke-nobody'
+        })
+        const byName = (list: FileEntry[], n: string) => list.find((e) => e.name === n)
+        const isRootUser = who?.uid === 0
+
+        push(
+          '权限串按 ls 的写法给',
+          byName(asMe, 'f644')?.modeText === 'rw-r--r--' && byName(asMe, 'f600')?.modeText === 'rw-------',
+          `${byName(asMe, 'f644')?.modeText || '空'} / ${byName(asMe, 'f600')?.modeText || '空'}`
+        )
+        push(
+          '只读文件和目录的权限也对',
+          byName(asMe, 'sub')?.modeText === 'rwx------' && byName(asMe, 'f444')?.modeText === 'r--r--r--',
+          `${byName(asMe, 'sub')?.modeText} / ${byName(asMe, 'f444')?.modeText}`
+        )
+        push(
+          '属主和属组都抠出来了',
+          !!byName(asMe, 'f644')?.owner && !!byName(asMe, 'f644')?.group,
+          `${byName(asMe, 'f644')?.owner}:${byName(asMe, 'f644')?.group}`
+        )
+        // root 不看权限位：444 也判可写。判成不可写会让人莫名其妙去 sudo
+        push(
+          'root 无视权限位',
+          asRoot.length > 0 && asRoot.every((e) => e.writable === true),
+          `${asRoot.filter((e) => e.writable !== true).length} 条判为不可写`
+        )
+        // 陌生人：这组样本的 other 位都没有 w，一条都不该可写
+        push(
+          '不属于自己/自己组的文件判为不可写',
+          asOther.length > 0 && asOther.every((e) => e.writable === false),
+          `${asOther.filter((e) => e.writable).length} 条判为可写`
+        )
+        push(
+          '属主自己按 owner 位判定',
+          byName(asMe, 'f600')?.writable === true &&
+            byName(asMe, 'f444')?.writable === (isRootUser ? true : false),
+          `600=${byName(asMe, 'f600')?.writable} 444=${byName(asMe, 'f444')?.writable}${
+            isRootUser ? '（root 例外）' : ''
+          }`
+        )
+
+        // ---- DOM：远程栏真的进这个目录，看两列渲染成什么样 ----
+        await js(`(() => {
+          const el = document.querySelectorAll('.fm .pane')[1]?.querySelector('.path-input')
+          if (!el) return 'no-input'
+          el.value = ${JSON.stringify(dir)}
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+          return 'ok'
+        })()`)
+        await wait(1800)
+
+        const dom = (await js(`(() => {
+          const pane = document.querySelectorAll('.fm .pane')[1]
+          const rows = [...(pane?.querySelectorAll('.rows .row') || [])]
+          return {
+            head: [...(pane?.querySelectorAll('.list-head span') || [])].map((s) => s.textContent.trim()),
+            rows: rows.map((r) => ({
+              name: r.querySelector('.fname')?.textContent?.trim() || '',
+              mode: r.querySelector('.col-mode')?.textContent?.trim() || '',
+              owner: r.querySelector('.col-owner')?.textContent?.trim() || '',
+              red: !!r.querySelector('.col-mode.nowrite')
+            }))
+          }
+        })()`)) as {
+          head: string[]
+          rows: { name: string; mode: string; owner: string; red: boolean }[]
+        }
+
+        push(
+          '表头多了「权限」和「用户 / 组」两列',
+          dom.head.includes('权限') && dom.head.includes('用户 / 组'),
+          dom.head.join(' | ')
+        )
+        push(
+          '每一行都显示了 9 位权限串',
+          dom.rows.length >= 4 && dom.rows.every((r) => /^[rwxsStT-]{9}$/.test(r.mode)),
+          `${dom.rows.length} 行，例 ${dom.rows[0]?.mode || '空'}`
+        )
+        push(
+          '用户 / 组按 `user:group` 显示',
+          dom.rows.length >= 4 && dom.rows.every((r) => /^[^:]+:[^:]+$/.test(r.owner)),
+          dom.rows[0]?.owner || '空'
+        )
+        // 红字必须和主进程算的一模一样：多标一行会让人白跑一趟 sudo，少标一行会白试一次保存
+        const mismatched = dom.rows.filter(
+          (r) => r.red !== (byName(asMe, r.name)?.writable === false)
+        )
+        push(
+          '红字只出现在真正写不了的行',
+          dom.rows.length >= 4 && mismatched.length === 0,
+          mismatched.map((r) => r.name).join(',') || '全部一致'
+        )
+        if (!isRootUser) {
+          push('444 那一行确实是红的', dom.rows.find((r) => r.name === 'f444')?.red === true, '')
+        }
+
+        /* 用 root 登录时永远不会有一行是红的（root 无视权限位），
+           于是 `.nowrite` 这条 CSS 在真机上永远走不到。这里手动挂一下类，
+           量一下颜色到底变没变 —— 只验"钩子接上了"，不伪造整行数据 */
+        const redStyle = (await js(`(() => {
+          const el = document.querySelector('.list.remote .row .col-mode')
+          if (!el) return null
+          const before = getComputedStyle(el).color
+          el.classList.add('nowrite')
+          const after = getComputedStyle(el).color
+          el.classList.remove('nowrite')
+          return { before, after }
+        })()`)) as { before: string; after: string } | null
+        push(
+          '标红真的接到了危险色上',
+          !!redStyle && redStyle.after !== redStyle.before,
+          `${redStyle?.before} → ${redStyle?.after}`
+        )
+
+        /* 窄窗口下这两列会把文件名挤没：容器查询该按"每栏宽度"收起它们 */
+        const [winW, winH] = mainWindow!.getSize()
+        mainWindow!.setSize(1080, 760)
+        // 改窗口尺寸后布局要再过一帧才稳，800ms 偶尔会量到中间态
+        await wait(1200)
+        const narrow = (await js(`(() => {
+          const pane = document.querySelectorAll('.fm .pane')[1]
+          const list = pane?.querySelector('.list')
+          const row = pane?.querySelector('.list .row')
+          const owner = pane?.querySelector('.col-owner')
+          const modeCell = pane?.querySelector('.col-mode')
+          const nameCell = pane?.querySelector('.col-name')
+          return {
+            paneW: Math.round(list?.getBoundingClientRect().width || 0),
+            ownerShown: !!owner && getComputedStyle(owner).display !== 'none',
+            modeShown: !!modeCell && getComputedStyle(modeCell).display !== 'none',
+            template: row ? getComputedStyle(row).gridTemplateColumns : '',
+            nameW: Math.round(nameCell?.getBoundingClientRect().width || 0),
+            listW: row ? Math.round(row.getBoundingClientRect().width) : 0
+          }
+        })()`)) as {
+          paneW: number
+          ownerShown: boolean
+          modeShown: boolean
+          template: string
+          nameW: number
+          listW: number
+        }
+        push(
+          '窄窗口下先舍属主列，不挤文件名',
+          narrow.paneW >= 560 || (!narrow.ownerShown && narrow.nameW > 90),
+          `栏宽 ${narrow.paneW}px（行宽 ${narrow.listW}），属主列${narrow.ownerShown ? '还在' : '已收起'}，权限列${
+            narrow.modeShown ? '还在' : '已收起'
+          }，文件名 ${narrow.nameW}px，栅格 ${narrow.template}`
+        )
+        mainWindow!.setSize(winW, winH)
+        await wait(1000)
+        await shot('thshell-perm.png')
+
+        // 属性面板也跟着改成同一套说法（`rw-r--r-- (644)` + `root:root`），顺手验一下
+        await js(`(() => {
+          const pane = document.querySelectorAll('.fm .pane')[1]
+          const row = [...(pane?.querySelectorAll('.rows .row') || [])].find((r) =>
+            r.textContent.includes('f644')
+          )
+          row?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+          row?.dispatchEvent(
+            new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 620, clientY: 300 })
+          )
+          return 'ok'
+        })()`)
+        await wait(600)
+        await js(
+          `[...document.querySelectorAll('.ctx-menu .ctx-item')].find((e) => e.textContent.trim() === '属性')?.click()`
+        )
+        await wait(600)
+        const propsText = (await js(`(() => {
+          return [...document.querySelectorAll('.props .prop-row')].map((r) => ({
+            k: r.querySelector('.prop-k')?.textContent?.trim() || '',
+            v: r.querySelector('.prop-v')?.textContent?.replace(/\\s+/g, ' ').trim() || ''
+          }))
+        })()`)) as { k: string; v: string }[]
+        const propOf = (k: string) => propsText.find((r) => r.k === k)?.v || ''
+        push(
+          '属性面板的权限带八进制',
+          /^[rwxsStT-]{9} \(\d{3}\)$/.test(propOf('权限')),
+          propOf('权限') || '没有这一行'
+        )
+        push(
+          '属性面板写了属主 / 属组',
+          /^[^:]+:[^:]+/.test(propOf('属主 / 属组')),
+          propOf('属主 / 属组') || '没有这一行'
+        )
+        await shot('thshell-perm-props.png')
+        await js(
+          `document.querySelector('.props')?.closest('.el-dialog')?.querySelector('.el-dialog__footer .el-button')?.click()`
+        )
+        await wait(400)
+        await ssh.exec(sid, `rm -rf ${dir}`)
+
+        let failed = 0
+        for (const [name, ok, detail] of checks) {
+          if (!ok) failed += 1
+          console.log(`[smoke] ${ok ? 'PASS' : 'FAIL'} ${name}${detail ? '：' + detail : ''}`)
+        }
+        console.log(`[smoke] perm ${failed ? failed + ' 项失败' : '全部通过'}（${checks.length} 项）`)
+
+        finish()
+        return
+      }
+
+      // sys 模式：系统信息页。先用一段真实格式的 shell 输出喂解析器逐项断言，
+      // 再连真机切到「系统」页截图 —— 解析这种事只在真机上肉眼看，坏了也看不出来。
+      if (mode === 'sys') {
+        await wait(1500)
+
+        const canned = [
+          '@@OS@@',
+          'NAME="Ubuntu"',
+          'VERSION="22.04.4 LTS (Jammy Jellyfish)"',
+          'PRETTY_NAME="Ubuntu 22.04.4 LTS"',
+          'ID=ubuntu',
+          '@@KERNEL@@',
+          'Linux 5.15.0-119-generic x86_64',
+          '@@HOST@@',
+          'th-node-01',
+          '@@CPU@@',
+          'model name\t: Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz',
+          '8',
+          '@@MEM@@',
+          'MemTotal:       32767684 kB',
+          'MemFree:         1234567 kB',
+          'MemAvailable:   20000000 kB',
+          '@@UP@@',
+          '10666560.78 42000000.00',
+          '@@LOAD@@',
+          '0.52 0.41 0.38 2/345 6789',
+          '@@PROC@@',
+          '187',
+          '@@DATE@@',
+          '2026-11-09 17:49:20 CST +0800',
+          '@@VIRT@@',
+          'kvm',
+          '@@DISK@@',
+          '/dev/sda1 ext4 40G 12G 26G 32% /boot',
+          '/dev/mapper/vg-root ext4 200G 150G 40G 79% /',
+          'tmpfs tmpfs 16G 0 16G 0% /dev/shm',
+          '@@INODE@@',
+          '/dev/sda1 ext4 2621440 300 2621140 1% /boot',
+          '/dev/mapper/vg-root ext4 13107200 120000 12987200 1% /',
+          'tmpfs tmpfs 4000000 2 3999998 1% /dev/shm',
+          '@@LINK@@',
+          '1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00',
+          '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000\\    link/ether 00:50:56:a1:b2:c3 brd ff:ff:ff:ff:ff:ff',
+          '3: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN mode DEFAULT group default\\    link/ether 02:42:1a:2b:3c:4d brd ff:ff:ff:ff:ff:ff',
+          '@@ADDR@@',
+          '1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever',
+          '2: eth0    inet 172.30.10.206/22 brd 172.30.11.255 scope global eth0\\       valid_lft forever preferred_lft forever',
+          '2: eth0    inet6 fe80::250:56ff:fea1:b2c3/64 scope link \\       valid_lft forever preferred_lft forever',
+          '3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever',
+          '@@ROUTE@@',
+          'default via 172.30.11.1 dev eth0 proto static',
+          '172.30.8.0/22 dev eth0 proto kernel scope link src 172.30.10.206',
+          '@@DNS@@',
+          'nameserver 172.30.0.2',
+          'nameserver 114.114.114.114',
+          '@@WHO@@',
+          'root     pts/0        2026-11-09 16:45 (10.200.58.237)',
+          'root     pts/1        2026-11-09 17:02 ()'
+        ].join('\n')
+
+        const fakeExec = async () => ({ code: 0, stdout: canned, stderr: '' })
+        const s = await collectSystemInfo(fakeExec)
+
+        const eth0 = s?.nets.find((n) => n.name === 'eth0')
+        const docker0 = s?.nets.find((n) => n.name === 'docker0')
+        const rootDisk = s?.disks.find((d) => d.mount === '/')
+
+        const checks: [string, boolean, string][] = [
+          ['发行版名', s?.os === 'Ubuntu 22.04.4 LTS', s?.os ?? '空'],
+          ['内核', s?.kernel === 'Linux 5.15.0-119-generic', s?.kernel ?? '空'],
+          ['架构', s?.arch === 'x86_64', s?.arch ?? '空'],
+          ['主机名', s?.hostname === 'th-node-01', s?.hostname ?? '空'],
+          ['CPU 型号', (s?.cpuModel ?? '').includes('E5-2680'), s?.cpuModel ?? '空'],
+          ['核心数', s?.cpuCores === 8, `${s?.cpuCores}`],
+          ['内存 MB', s?.memTotal === 32000, `${s?.memTotal}`],
+          ['Swap 未启用', s?.swapTotal === 0, `${s?.swapTotal}`],
+          ['运行时长', s?.uptime === 10666561, `${s?.uptime}s`],
+          ['负载', s?.load1 === 0.52, `${s?.load1}`],
+          ['进程数', s?.processes === 187, `${s?.processes}`],
+          ['虚拟化', s?.virt === 'kvm', s?.virt ?? '空'],
+          ['磁盘行数', s?.disks.length === 3, `${s?.disks.length}`],
+          ['根分区使用率', rootDisk?.usePercent === 79, `${rootDisk?.usePercent}`],
+          ['根分区 inode 已合并', rootDisk?.inodePercent === 1, `${rootDisk?.inodePercent}`],
+          ['网卡排除 lo', s?.nets.length === 2, (s?.nets ?? []).map((n) => n.name).join(',')],
+          ['eth0 是 UP', eth0?.up === true, `${eth0?.up}`],
+          ['eth0 取到 IPv4', eth0?.ipv4[0] === '172.30.10.206/22', eth0?.ipv4.join(',') ?? '空'],
+          ['跳过链路本地 IPv6', (eth0?.ipv6.length ?? -1) === 0, (eth0?.ipv6 ?? []).join(',')],
+          ['docker0 是 DOWN', docker0?.up === false, `${docker0?.up}`],
+          ['默认网关', s?.gateways[0] === '172.30.11.1', (s?.gateways ?? []).join(',')],
+          ['DNS 两条', s?.dns.length === 2, (s?.dns ?? []).join(',')],
+          ['登录会话两条', s?.sessions.length === 2, `${s?.sessions.length}`]
+        ]
+
+        /**
+         * 未挂载磁盘的筛选规则：已挂载的、loop/sr0、以及"上面有分区但自己没文件系统的整盘"
+         * 都不该出现在列表里 —— 最后这条最容易错，整盘挂上去等于把分区表盖住。
+         */
+        const lsblkCanned = [
+          'NAME="sda" PATH="/dev/sda" SIZE="20G" TYPE="disk" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL="VMware Virtual disk"',
+          'NAME="sda1" PATH="/dev/sda1" SIZE="1G" TYPE="part" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL=""',
+          'NAME="sdb" PATH="/dev/sdb" SIZE="500G" TYPE="disk" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL="DATA"',
+          'NAME="sdb1" PATH="/dev/sdb1" SIZE="492G" TYPE="part" FSTYPE="xfs" MOUNTPOINT="" LABEL="data" MODEL=""',
+          'NAME="sdb2" PATH="/dev/sdb2" SIZE="8G" TYPE="part" FSTYPE="swap" MOUNTPOINT="[SWAP]" LABEL="" MODEL=""',
+          'NAME="sr0" PATH="/dev/sr0" SIZE="1024M" TYPE="rom" FSTYPE="" MOUNTPOINT="" LABEL="" MODEL=""',
+          'NAME="loop0" PATH="/dev/loop0" SIZE="56M" TYPE="loop" FSTYPE="squashfs" MOUNTPOINT="/snap/core/1" LABEL="" MODEL=""'
+        ].join('\n')
+        const umDisks = await listUnmountedDisks(async () => ({
+          code: 0,
+          stdout: `@@LSBLK@@\n${lsblkCanned}\n@@FSTAB@@\n`,
+          stderr: ''
+        }))
+        checks.push(['未挂载磁盘：只留未挂载分区', umDisks.length === 3, umDisks.map((d) => d.path).join(',')])
+        checks.push(['未挂载磁盘：带文件系统的可挂', umDisks.some((d) => d.path === '/dev/sdb1' && d.fstype === 'xfs'), ''])
+        checks.push(['未挂载磁盘：空文件系统标出来', umDisks.some((d) => d.path === '/dev/sda1' && !d.fstype), ''])
+        checks.push(['未挂载磁盘：swap 分区单独标记', umDisks.some((d) => d.path === '/dev/sdb2' && d.isSwap), ''])
+        checks.push(['未挂载磁盘：不列整盘', !umDisks.some((d) => d.path === '/dev/sdb'), ''])
+        checks.push(['未挂载磁盘：不列 loop / 光驱', !umDisks.some((d) => /loop|sr0/.test(d.path)), ''])
+
+        /** 网络配置读取：nmcli 分支 */
+        const fakeNm = async (cmd: string) => {
+          if (cmd.includes('nmcli -t -f ipv4.method')) {
+            return {
+              code: 0,
+              stdout:
+                'ipv4.method:manual\nipv4.addresses:10.0.0.5/24\nipv4.gateway:10.0.0.1\nipv4.dns:8.8.8.8,1.1.1.1\n',
+              stderr: ''
+            }
+          }
+          return {
+            code: 0,
+            stdout:
+              '@@NM@@\nyes\n@@CON@@\nWired connection 1:ens160:802-3-ethernet:yes\neth-legacy:wlan0:802-11-wireless:no\n@@IFCFG@@\n@@NETPLAN@@\n',
+            stderr: ''
+          }
+        }
+        const nmCfg = await readNetConfig(fakeNm, 'ens160')
+        checks.push(['配网：认出 NetworkManager', nmCfg.backend === 'nmcli', nmCfg.backend])
+        checks.push(['配网：连接名跟设备名分开取', nmCfg.connName === 'Wired connection 1', nmCfg.connName])
+        checks.push(['配网：静态地址读成 CIDR', nmCfg.addresses[0] === '10.0.0.5/24', nmCfg.addresses.join(',')])
+        checks.push(['配网：DNS 拆成多条', nmCfg.dns.length === 2, nmCfg.dns.join(',')])
+
+        /** 网络配置读取：ifcfg 分支（没有 nmcli 的老 CentOS） */
+        const fakeIfcfg = async () => ({
+          code: 0,
+          stdout:
+            '@@NM@@\nno\n@@CON@@\n@@IFCFG@@\nDEVICE="eth0"\nBOOTPROTO="none"\nIPADDR="192.168.1.10"\nNETMASK="255.255.255.0"\nGATEWAY="192.168.1.1"\nDNS1="223.5.5.5"\nONBOOT="yes"\n@@NETPLAN@@\n',
+          stderr: ''
+        })
+        const ifcfgCfg = await readNetConfig(fakeIfcfg, 'eth0')
+        checks.push(['配网：认 ifcfg 文件', ifcfgCfg.backend === 'ifcfg', ifcfgCfg.backend])
+        checks.push([
+          '配网：NETMASK 折成前缀',
+          ifcfgCfg.addresses[0] === '192.168.1.10/24',
+          ifcfgCfg.addresses.join(',')
+        ])
+
+        // 连真机看界面：解析对了不代表页面排得下
+        await js(
+          `document.querySelector('.server-item')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`
+        )
+        await wait(5000)
+        await js(
+          `[...document.querySelectorAll('.seg-btn')].find((b) => b.textContent.includes('系统'))?.click()`
+        )
+        await wait(2500)
+        const dom = (await js(`(() => {
+          const rows = document.querySelectorAll('.sys .tbl .tr:not(.th)').length
+          const ifaces = document.querySelectorAll('.sys .iface').length
+          const table = document.querySelector('.sys .tbl')?.textContent || ''
+          const body = document.querySelector('.sys-body')?.textContent || ''
+          return { rows, ifaces, overlay: table.includes('overlay2'), fold: !!document.querySelector('.sys .extra-toggle'), unsupported: body.includes('没有返回系统信息') }
+        })()`)) as {
+          rows: number
+          ifaces: number
+          overlay: boolean
+          fold: boolean
+          unsupported: boolean
+        }
+        checks.push(['真机：磁盘行渲染', dom.rows > 0, `${dom.rows} 行`])
+        checks.push(['真机：滤掉 docker 分层挂载', !dom.overlay, ''])
+        checks.push(['真机：业务网卡渲染', dom.ifaces > 0, `${dom.ifaces} 张`])
+        checks.push(['真机：虚拟网卡折叠', dom.fold === true, ''])
+        checks.push(['真机：采到了系统信息', !dom.unsupported, ''])
+        await wait(400)
+        await shot('thshell-sysinfo.png')
+        // 网络和会话在折叠线以下，滚到底再拍一张
+        await js(`(() => { const b = document.querySelector('.sys-body'); if (b) b.scrollTop = 99999; return 'ok' })()`)
+        await wait(400)
+        await shot('thshell-sysinfo-net.png')
+
+        // 折叠区要能展开：这里坏掉的话界面上看不出问题，只是"点了没反应"
+        await js(`document.querySelector('.sys .extra-toggle')?.click()`)
+        await wait(400)
+        const extraRows = (await js(`document.querySelectorAll('.sys .extra-row').length`)) as number
+        checks.push(['展开虚拟网卡', extraRows > 0, `${extraRows} 行`])
+        await shot('thshell-sysinfo-fold.png')
+
+        /**
+         * 未挂载磁盘：df 里根本不会出现它们，只能靠新增的 lsblk 扫描。
+         * 这台机器如果没有未挂载分区，"0 行 + 一句空态文案"就是正确结果。
+         */
+        const um = (await js(`(() => {
+          const box = document.querySelector('.sys .unmounted')
+          return {
+            exists: !!box,
+            rows: document.querySelectorAll('.sys .um-row').length,
+            err: document.querySelector('.sys .um-empty.err')?.textContent?.trim() || '',
+            empty: document.querySelector('.sys .um-empty:not(.err)')?.textContent?.trim() || ''
+          }
+        })()`)) as { exists: boolean; rows: number; err: string; empty: string }
+        checks.push(['未挂载磁盘区块存在', um.exists, ''])
+        checks.push(['未挂载扫描没有报错', !um.err, um.err || `行数=${um.rows}`])
+
+        // 网络配置弹窗：能打开、并且认得出这台机器用哪种方式管网络
+        await js(`(() => {
+          const b = [...document.querySelectorAll('.sys .iface .el-button')].find((x) =>
+            (x.textContent || '').includes('配置')
+          )
+          b?.click()
+          return 'ok'
+        })()`)
+        await wait(1600)
+        const netDlg = (await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')].find((x) =>
+            (x.textContent || '').includes('配置网络')
+          )
+          if (!d) return { open: false, chips: [], device: '' }
+          return {
+            open: true,
+            chips: [...d.querySelectorAll('.dlg-row .chip')].map((c) => (c.textContent || '').trim()),
+            device: d.querySelector('.dlg-row .dlg-v')?.textContent?.trim() || ''
+          }
+        })()`)) as { open: boolean; chips: string[]; device: string }
+        checks.push(['网络配置弹窗能打开', netDlg.open, netDlg.device])
+        checks.push([
+          '识别出网络管理方式',
+          netDlg.chips.length > 0 && !netDlg.chips.includes('未识别'),
+          netDlg.chips.join(' / ')
+        ])
+        await shot('thshell-syscfg.png')
+        // 关掉弹窗，别把遮罩留给后面的断言
+        await js(`(() => {
+          const d = [...document.querySelectorAll('.el-dialog')].find((x) =>
+            (x.textContent || '').includes('配置网络')
+          )
+          d?.querySelector('.el-dialog__headerbtn')?.click()
+          return 'ok'
+        })()`)
+        await wait(500)
 
         let failed = 0
         for (const [name, ok, detail] of checks) {
@@ -2951,6 +6112,7 @@ function createWindow(): void {
             `[...document.querySelectorAll('.tab-title')].map((t) => t.textContent.trim())`
           )) as string[]
 
+
         // 1. 按钮存在，且在「新建连接」左边（用户明确要求的位置）
         const layout = (await js(`(() => {
           const btns = [...document.querySelectorAll('.actions .el-button')]
@@ -3048,6 +6210,93 @@ function createWindow(): void {
           finish()
           return
         }
+
+        /**
+         * 0. 浅色主题下的 ANSI 配色必须还看得见。
+         *
+         * PowerShell 的 PSReadLine 用标准 16 色画语法高亮：命令名 93(brightYellow)、
+         * 裸参数 37(white)、行内预测 97(brightWhite)。这三档原来是照深色底配的浅色，
+         * 搬到白底上对比度只有 1~2:1 —— 表现就是"cd D: 里的 D: 怎么这么浅"。
+         * 这里按 WCAG 算对比度，低于标准就不放过。
+         */
+        for (let i = 0; i < 20; i += 1) {
+          if (await js(`!!window.__termTheme`)) break
+          await wait(150)
+        }
+        const prevTheme = (await js(`window.__store.config.settings.theme`)) as string
+        await js(`window.__store.config.settings.theme = 'light'`)
+        await wait(600)
+
+        const ratio = (await js(`(() => {
+          const t = window.__termTheme
+          if (!t) return null
+          const lum = (hex) => {
+            const n = parseInt(String(hex).slice(1), 16)
+            return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+              .map((v) => {
+                const s = v / 255
+                return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4)
+              })
+              .reduce((a, v, k) => a + v * [0.2126, 0.7152, 0.0722][k], 0)
+          }
+          const cr = (a, b) => {
+            const l1 = lum(a)
+            const l2 = lum(b)
+            return +(((Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)).toFixed(2))
+          }
+          const bg = t.background
+          return {
+            bg,
+            white: cr(t.white, bg),
+            brightWhite: cr(t.brightWhite, bg),
+            brightYellow: cr(t.brightYellow, bg),
+            bright: ['brightRed', 'brightGreen', 'brightBlue', 'brightMagenta', 'brightCyan'].map(
+              (k) => cr(t[k], bg)
+            )
+          }
+        })()`)) as
+          | { bg: string; white: number; brightWhite: number; brightYellow: number; bright: number[] }
+          | null
+
+        push(
+          '浅色主题下 ANSI 白（37）在白底上读得清',
+          !!ratio && ratio.white >= 4.5,
+          ratio
+            ? `${ratio.white}:1（背景 ${ratio.bg}）`
+            : `没拿到配色 · ${JSON.stringify(
+                await js(
+                  `({ hasTheme: !!window.__termTheme, hasXterm: !!document.querySelector('.xterm'), theme: window.__store?.config?.settings?.theme })`
+                )
+              )}`
+        )
+        push(
+          '浅色主题下命令名（93）读得清',
+          !!ratio && ratio.brightYellow >= 4.5,
+          ratio ? `${ratio.brightYellow}:1` : ''
+        )
+        push(
+          '浅色主题下行内预测（97）读得清',
+          !!ratio && ratio.brightWhite >= 3,
+          ratio ? `${ratio.brightWhite}:1` : ''
+        )
+        push(
+          '浅色主题下整套 bright 不糊进背景',
+          !!ratio && ratio.bright.every((v) => v >= 3),
+          ratio ? ratio.bright.map((v) => v + ':1').join(' / ') : ''
+        )
+
+        // 留一张浅色主题的实拍：敲 `cd D:`（不回车），让 PSReadLine 把语法高亮画出来，
+        // 一眼就能看出 37 号色那截现在读不读得清
+        await js(`window.api.shell.write(${JSON.stringify(sid)}, 'cd D:')`)
+        await wait(600)
+        await shot('thshell-local-light.png')
+        // Ctrl+U 清掉这一行，别把后面的光标/尺寸断言搅了
+        await js(`window.api.shell.write(${JSON.stringify(sid)}, '\\u0015')`)
+        await wait(300)
+
+        // 验完改回去，别把后面的截图变成浅色主题
+        await js(`window.__store.config.settings.theme = ${JSON.stringify(prevTheme)}`)
+        await wait(400)
 
         // 3. 本地终端不该带 SSH 的那几件套
         const paneStats = (await js(`(() => {
@@ -3485,6 +6734,109 @@ function createWindow(): void {
         push('fill 标记没被长命令挤掉', panel.editClipped === 0, panel.editClipped ? `${panel.editClipped} 张卡片的 ✎ 被裁掉了` : `${panel.fills} 张都完整`)
         // 浮层向上展开，顶边不能被顶出窗口
         push('浮层没有顶出窗格', panel.top >= 0 && panel.height > 100, `top=${panel.top} h=${panel.height} 窗高=${panel.viewH}`)
+
+        /**
+         * 搜索：命令表只会越来越长，靠翻是找不到的。
+         * 直接改 input.value 再派发 input 事件 —— Vue 的 v-model 监听的就是它，
+         * 不用模拟真实键盘（冒烟实例常不在前台，合成按键会丢）。
+         */
+        const typeQp = async (text: string) => {
+          await js(`(() => {
+            const inp = document.querySelector('.quick-panel .qs-input')
+            if (!inp) return
+            inp.value = ${JSON.stringify(text)}
+            inp.dispatchEvent(new Event('input', { bubbles: true }))
+          })()`)
+          await wait(250)
+        }
+
+        const qpState = () =>
+          js(`(() => {
+            const p = document.querySelector('.quick-panel')
+            if (!p) return null
+            const q = ((p.querySelector('.qs-input') || {}).value || '').trim().toLowerCase()
+            const groups = [...p.querySelectorAll('.qp-group')].map((g) => ({
+              label: ((g.querySelector('.qp-glabel') || {}).textContent || '').trim(),
+              texts: [...g.querySelectorAll('.qp-chip')].map((c) => (c.textContent || '').replace(/\\s+/g, ' '))
+            }))
+            const texts = groups.flatMap((g) => g.texts)
+            // 卡片上、或它所在的分组名上，必须真能看见搜的那个词 —— 否则过滤看着像乱来
+            const oddTexts = !q
+              ? []
+              : groups.flatMap((g) =>
+                  g.label.toLowerCase().includes(q)
+                    ? []
+                    : g.texts.filter((t) => !t.toLowerCase().includes(q)).map((t) => g.label + '|' + t)
+                )
+            const odd = oddTexts.length
+            return {
+              n: texts.length,
+              texts,
+              odd,
+              oddTexts,
+              marks: p.querySelectorAll('.qp-hit').length,
+              hint: (p.querySelector('.qp-hint')?.textContent || '').trim(),
+              empty: !!p.querySelector('.qp-empty')
+            }
+          })()`) as Promise<{
+            n: number
+            texts: string[]
+            odd: number
+            oddTexts: string[]
+            marks: number
+            hint: string
+            empty: boolean
+          } | null>
+
+        push('面板带搜索框', (await js(`!!document.querySelector('.quick-panel .qs-input')`)) as boolean, '')
+
+        await typeQp('磁盘')
+        const byWord = await qpState()
+        push(
+          '搜关键词能过滤',
+          !!byWord &&
+            byWord.n > 0 &&
+            byWord.n < panel.items &&
+            byWord.texts.some((t) => t.includes('df -i')) &&
+            !byWord.texts.some((t) => t.includes('uptime')) &&
+            /找到\s*\d+\s*条/.test(byWord.hint),
+          byWord ? `${byWord.n}/${panel.items} 条 · ${byWord.hint}` : '搜索框没找到'
+        )
+        push(
+          '命中的词都能在卡片或分组名上看见',
+          !!byWord && byWord.odd === 0,
+          byWord ? (byWord.odd ? byWord.oddTexts.join(' · ') : '全部对得上') : ''
+        )
+
+        await typeQp('docker')
+        const byName = await qpState()
+        push(
+          '搜命令名也能过滤，命中处高亮',
+          !!byName &&
+            byName.n > 0 &&
+            byName.n < panel.items &&
+            byName.texts.some((t) => t.includes('docker ps -a')) &&
+            byName.marks > 0,
+          byName ? `${byName.n} 条 / ${byName.marks} 处高亮` : ''
+        )
+        // 留一张过滤态给人工目检：高亮的底色、卡片网格在被筛掉大半后是否还排得整齐
+        await shot('thshell-quick-search.png')
+
+        await typeQp('zzzz')
+        const noHit = await qpState()
+        push(
+          '搜不到时给空态而不是空白',
+          !!noHit && noHit.n === 0 && noHit.empty,
+          noHit ? noHit.hint : ''
+        )
+
+        await typeQp('')
+        const restored = await qpState()
+        push(
+          '清空搜索后回到全量列表',
+          !!restored && restored.n === panel.items,
+          restored ? `${restored.n} 条` : ''
+        )
 
         // 浮层里的命令也要有悬停说明；顺便验 fill 类多一行"只插入不执行"
         const fillTip = await tipOf('.qp-chip.fill', 0)
@@ -4165,7 +7517,7 @@ function createWindow(): void {
         await js(
           `window.__store.config.settings.updateFeed = ${JSON.stringify(`${base}/slow.json`)}`
         )
-        await js(`document.querySelectorAll('.menubar .el-dropdown .mb')[0]?.click()`)
+        await js(`document.querySelectorAll('.actions .el-dropdown button')[0]?.click()`)
         await wait(500)
         await js(
           `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')]
@@ -4255,7 +7607,7 @@ function createWindow(): void {
 
         // 8. 界面上「检查更新」能打开（没配更新源时应该是引导去配置，而不是空白）
         await wait(400)
-        await js(`document.querySelectorAll('.menubar .el-dropdown .mb')[0]?.click()`)
+        await js(`document.querySelectorAll('.actions .el-dropdown button')[0]?.click()`)
         await wait(600)
         const items = (await js(
           `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')].map((i) => i.textContent.trim())`
@@ -4306,12 +7658,67 @@ function createWindow(): void {
         const checks: [string, boolean, string][] = []
         const push = (name: string, ok: boolean, detail = '') => checks.push([name, ok, detail])
 
-        const items = (await js(
-          `[...document.querySelectorAll('.menubar .mb')].map((b) => b.textContent.trim())`
-        )) as string[]
-        push('菜单栏有两项', items.length === 2, items.join(' | '))
-        push('第一项是「收起侧边栏」', (items[0] || '').includes('收起侧边栏'), items[0] || '无')
-        push('第二项是「关于」', (items[1] || '').includes('关于'), items[1] || '无')
+        // 收起按钮搬进侧边栏之后，标题栏只剩"救回来"的那一颗，所以要按状态分别验
+        const actionsTail = (await js(`(() => {
+          const box = document.querySelector('.actions')
+          if (!box) return null
+          const kids = [...box.children]
+          return {
+            last: kids[kids.length - 1]?.className || '',
+            prevIcon: (kids[kids.length - 2]?.getAttribute('title') || '')
+          }
+        })()`)) as { last: string; prevIcon: string } | null
+        push(
+          '「关于」是操作区最后一个按钮',
+          !!actionsTail && actionsTail.last.includes('about-wrap'),
+          actionsTail ? actionsTail.last : '没有 .actions'
+        )
+        push(
+          '它前面紧挨着「设置」',
+          !!actionsTail && actionsTail.prevIcon.includes('设置'),
+          actionsTail ? actionsTail.prevIcon : ''
+        )
+
+        // 设置 / 关于这两个是纯图标按钮：描边必须是透明的，否则像两枚浮在标题栏上的圆片
+        const circleBorder = (await js(`(() => {
+          const bs = [...document.querySelectorAll('.actions .el-button.is-circle')]
+          return bs.length ? bs.map((b) => getComputedStyle(b).borderTopColor) : null
+        })()`)) as string[] | null
+        push(
+          '设置 / 关于 两个圆按钮没有描边',
+          !!circleBorder && circleBorder.length === 2 && circleBorder.every((c) => c === 'rgba(0, 0, 0, 0)'),
+          circleBorder ? circleBorder.join(' / ') : '没找到圆按钮'
+        )
+
+        // 侧边栏开关键固定在标题栏：只有图标、没有文字，标题栏左侧才不至于被一串汉字占住
+        const tbToggle = (await js(`(() => {
+          const b = document.querySelector('.menubar .mb')
+          if (!b) return null
+          return {
+            title: b.getAttribute('title') || '',
+            text: (b.textContent || '').trim(),
+            hasIcon: !!b.querySelector('.el-icon')
+          }
+        })()`)) as { title: string; text: string; hasIcon: boolean } | null
+        push(
+          '标题栏有侧边栏开关，且只有图标没有文字',
+          !!tbToggle && tbToggle.hasIcon && !tbToggle.text && tbToggle.title.includes('收起侧边栏'),
+          tbToggle ? `title=${tbToggle.title} 文字「${tbToggle.text}」` : '没有'
+        )
+
+        // 搜索行回到两个控件：输入框 + 新建分组（收起按钮已经搬回标题栏）
+        const searchRow = (await js(`(() => {
+          const row = document.querySelector('.sidebar .search-row')
+          if (!row) return null
+          const kids = [...row.children]
+          const last = kids[kids.length - 1]
+          return {
+            n: kids.length,
+            lastIsBtn: !!last && last.tagName === 'BUTTON' && last.classList.contains('is-circle')
+          }
+        })()`)) as { n: number; lastIsBtn: boolean } | null
+        push('搜索行只有两个控件（输入框 + 新建分组）', !!searchRow && searchRow.n === 2, `${searchRow?.n ?? 0} 个`)
+        push('最后一个按钮是「新建分组」', !!searchRow && searchRow.lastIsBtn, searchRow?.lastIsBtn ? '是按钮' : '不是按钮')
 
         // 收起是 v-show（display:none），量宽度比读 style 可靠
         const sideW = async () =>
@@ -4325,18 +7732,40 @@ function createWindow(): void {
         const before = await sideW()
         push('侧边栏初始可见', before > 100, `${before}px`)
 
-        await js(`document.querySelectorAll('.menubar .mb')[0]?.click()`)
+        // 收起 / 展开都点标题栏那一颗（同一颗按钮，图标和 title 跟着状态变）
+        await js(`document.querySelector('.menubar .mb')?.click()`)
         await wait(450)
         const folded = await sideW()
-        const label = (await js(`document.querySelectorAll('.menubar .mb')[0]?.textContent.trim()`)) as string
-        push('点一下收起了侧边栏', folded === 0, `${before} → ${folded}px`)
-        push('按钮文案变成「展开侧边栏」', label.includes('展开'), label)
+        push('点标题栏的开关能收起', folded === 0, `${before} → ${folded}px`)
+
+        const rescue = (await js(`(() => {
+          const b = document.querySelector('.menubar .mb')
+          if (!b) return null
+          return {
+            title: b.getAttribute('title') || '',
+            text: (b.textContent || '').trim(),
+            hasIcon: !!b.querySelector('.el-icon')
+          }
+        })()`)) as { title: string; text: string; hasIcon: boolean } | null
+        push(
+          '收起后同一颗按钮换成「展开」',
+          !!rescue && rescue.hasIcon && !rescue.text && rescue.title.includes('展开'),
+          rescue ? `title=${rescue.title} 文字「${rescue.text}」` : '没有'
+        )
         await shot('thshell-bar-folded.png')
 
-        await js(`document.querySelectorAll('.menubar .mb')[0]?.click()`)
+        await js(`document.querySelector('.menubar .mb')?.click()`)
         await wait(450)
         const reopened = await sideW()
-        push('再点一下展开回来', reopened > 100, `${reopened}px`)
+        push('再点一次展开回来', reopened > 100, `${reopened}px`)
+        push(
+          '展开后按钮回到「收起」，且没多出一颗',
+          (await js(`(() => {
+            const bs = [...document.querySelectorAll('.menubar .mb')]
+            return bs.length === 1 && (bs[0].getAttribute('title') || '').includes('收起侧边栏')
+          })()`)) as boolean,
+          ''
+        )
 
         // Ctrl+B 走的是 App 里的同一个 keydown 监听；用合成事件，不碰真键盘
         const ctrlB = `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true }))`
@@ -4363,7 +7792,7 @@ function createWindow(): void {
             .pop()?.querySelector('.el-dialog__headerbtn')?.click()`)
 
         const openAbout = async () => {
-          await js(`document.querySelectorAll('.menubar .el-dropdown .mb')[0]?.click()`)
+          await js(`document.querySelectorAll('.actions .el-dropdown button')[0]?.click()`)
           await wait(600)
         }
         const clickMenu = (text: string) =>
@@ -4374,10 +7803,10 @@ function createWindow(): void {
         const menuItems = (await js(
           `[...document.querySelectorAll('.tb-dropdown .el-dropdown-menu__item')].map((i) => i.textContent.trim())`
         )) as string[]
-        push('下拉有四项', menuItems.length === 4, menuItems.join(' | '))
+        push('关于下拉有三项', menuItems.length === 3, menuItems.join(' | '))
         push(
-          '四项是 关于 / 配置 / 检查更新 / 使用说明',
-          menuItems.join('|') === '关于 ThShell|配置|检查更新|使用说明',
+          '三项是 关于 / 检查更新 / 使用说明',
+          menuItems.join('|') === '关于 ThShell|检查更新|使用说明',
           menuItems.join('|')
         )
         await shot('thshell-bar-about.png')
@@ -4408,9 +7837,13 @@ function createWindow(): void {
         )
         await shot('thshell-bar-dropdown-tint.png')
 
-        await clickMenu('配置')
+        // 「配置」已经从下拉里拿掉了 —— 齿轮就贴在旁边，重复一项只会让人多想一秒
+        await js(`(() => {
+          const bs = [...document.querySelectorAll('.actions > button.el-button')]
+          bs[bs.length - 1]?.click()
+        })()`)
         await wait(700)
-        push('「配置」打开设置弹窗', await dialogOpen('设置'))
+        push('齿轮按钮打开设置弹窗', await dialogOpen('设置'))
         // 更新源已经内置，设置里不该再冒出那个输入框 —— 加回来就等于又把选择推给用户
         const feedInput = (await js(`(() => {
           const d = [...document.querySelectorAll('.el-dialog')]
@@ -4668,6 +8101,112 @@ function createWindow(): void {
           expanded.text.find((t) => t.includes('D:\\backup'))?.slice(0, 80) || '没找到'
         )
 
+        /**
+         * 拖动标题栏改记录区高度。
+         *
+         * 合成 PointerEvent 是能跑到 window 上的监听里的（我们的 move/up 就挂在 window），
+         * 只是浏览器不会为合成事件补 click —— 所以"拖完紧跟一次 click 不能收起面板"
+         * 这条得自己 dispatch 一下才验得到。
+         * 数值断言用的是行内的 --dock-h：max-height 是"上限"，内容不足时量渲染高度看不出变化。
+         */
+        const dockSize = async () =>
+          (await js(`(() => {
+            const l = document.querySelector('.dock .dock-list')
+            if (!l) return { v: 0, rect: 0, stored: 0 }
+            return {
+              v: Math.round(parseFloat(l.style.getPropertyValue('--dock-h')) || 0),
+              rect: Math.round(l.getBoundingClientRect().height),
+              stored: Math.round(Number(localStorage.getItem('thshell.transferDock.height')) || 0)
+            }
+          })()`)) as { v: number; rect: number; stored: number }
+
+        /**
+         * dy > 0 是往下拖（变矮），dy < 0 是往上拖（变高）。
+         *
+         * 这里必须走 sendInputEvent，不能用合成 PointerEvent：
+         * 合成事件是直接 dispatch 到监听器上的，绕过了 Chromium 的 hit-test，
+         * 于是"元素被别的层盖住、或者压根没接到 pointerdown"这类问题一条都验不出来 ——
+         * 之前就是这么放过去的（真实鼠标拖不动，冒烟却全绿）。
+         */
+        const dragHead = async (dy: number) => {
+          const box = (await js(`(() => {
+            const h = document.querySelector('.dock .head')
+            if (!h) return null
+            const r = h.getBoundingClientRect()
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), bottom: window.innerHeight - 2 }
+          })()`)) as { x: number; y: number; bottom: number } | null
+          if (!box) throw new Error('拖拽手柄不在')
+          const wc = mainWindow!.webContents
+          // 起点别落在「清空」按钮上
+          const x = Math.round(box.x * 0.35)
+          wc.sendInputEvent({ type: 'mouseMove', x, y: box.y })
+          await wait(60)
+          wc.sendInputEvent({ type: 'mouseDown', x, y: box.y, button: 'left', clickCount: 1 })
+          await wait(60)
+          // 真实拖动是一串 move，不是一步到位；分 8 步走，每步让一帧
+          const target = Math.max(2, Math.min(box.bottom, box.y + dy))
+          const steps = 8
+          for (let i = 1; i <= steps; i++) {
+            const y = Math.round(box.y + ((target - box.y) * i) / steps)
+            wc.sendInputEvent({ type: 'mouseMove', x, y, button: 'left' })
+            await wait(24)
+          }
+          wc.sendInputEvent({ type: 'mouseUp', x, y: target, button: 'left', clickCount: 1 })
+          await wait(260)
+        }
+
+        const headCursor = (await js(
+          `getComputedStyle(document.querySelector('.dock .head')).cursor`
+        )) as string
+        push('展开时标题栏是上下拖拽的手柄', headCursor === 'ns-resize', headCursor)
+
+        // 往下狠拖：变矮，而且要真的落在列表的渲染高度上
+        await dragHead(600)
+        const lowest = await dockSize()
+        push(
+          '往下拖真的变矮（作用到渲染高度，不只是改了个变量）',
+          lowest.v < 260 && lowest.rect === lowest.v,
+          `上限 ${lowest.v}px / 实测 ${lowest.rect}px`
+        )
+
+        /* 用户报的"拖不动"就出在这：以前 --dock-h 只当 max-height 用，
+         * 记录只有两三条时内容本来就撑不满上限，往上拖把 260 改成 400
+         * 界面上一点变化都没有。现在拖过一次就锁成固定高度，拖多少就是多少。 */
+        const sizing = (await js(`(() => {
+          const l = document.querySelector('.dock .dock-list')
+          const cs = getComputedStyle(l)
+          return { h: cs.height, max: cs.maxHeight, manual: l.classList.contains('manual') }
+        })()`)) as { h: string; max: string; manual: boolean }
+        push(
+          '拖过之后列表是固定高度，不再只是"上限"',
+          sizing.manual && sizing.max === 'none' && Math.round(parseFloat(sizing.h)) === lowest.v,
+          `height=${sizing.h} max-height=${sizing.max}`
+        )
+
+        // 浏览器在真实拖动后一定会补一个 click，不能让它把面板收起来
+        await js(`document.querySelector('.dock .head').click()`)
+        await wait(200)
+        push(
+          '拖完紧跟的那次点击不会把面板收起',
+          (await js(`!!document.querySelector('.dock .dock-list')`)) as boolean,
+          ''
+        )
+
+        // 窗口够高时一次就拖到底了；不够高再往上顶一次补到最小高度
+        if (lowest.v > 56) await dragHead(-(lowest.v - 56 + 30))
+        const floor = await dockSize()
+        push('能压到最小高度（56 = 一条记录）', floor.v === 56 && floor.rect === 56, `${lowest.v} → ${floor.v}px`)
+
+        // 再往上拖 90px：像素级跟着走，并且记进 localStorage
+        await dragHead(-90)
+        const taller = await dockSize()
+        push('往上拖按像素长高', taller.v === 146 && taller.rect === 146, `${floor.v} → ${taller.v}px`)
+        push('高度记在本机（下次打开还是这个高度）', taller.stored === 146, `localStorage=${taller.stored}`)
+
+        // 恢复默认高度，后面的截图和排版断言按 260 来（dy 为正 = 往下拖 = 变矮）
+        await dragHead(taller.v - 260)
+        push('可以再拖回默认高度', (await dockSize()).v === 260, `${taller.v} → 260px`)
+
         // 暂停 / 取消按钮：进行中的行必须各有两个，且提示文案对得上
         const btns = (await js(`(() => {
           const rows = [...document.querySelectorAll('.dock .row.live')]
@@ -4731,6 +8270,23 @@ function createWindow(): void {
             at: now - 3_600_000,
             ms: 1_200,
             error: '权限不足：/database/qc_data.csv'
+          },
+          /**
+           * 手动取消的那条：主进程写的是 canceled 而不是 error。
+           * 曾经界面只认 error，于是取消的记录被显示成绿色的「已完成」——
+           * 用户明明点了取消，界面却说他传完了。
+           */
+          {
+            id: 'smoke-rec-canceled',
+            direction: 'upload' as const,
+            filename: 'db-dump.sql',
+            from: 'D:\\dump\\db-dump.sql',
+            to: '/database/db-dump.sql',
+            name: 'db-dump.sql',
+            size: 1_800 * MB,
+            at: now - 7_200_000,
+            ms: 8_400,
+            canceled: true
           }
         ]
         for (const rec of fake) appendTransfer(rec)
@@ -4748,6 +8304,12 @@ function createWindow(): void {
         push('记下了目标目录', withHistory.text.some((t) => t.includes('Downloads\\dmbak')), '')
         push('目录传输标了「文件夹」', withHistory.text.some((t) => t.includes('文件夹')), '')
         push('失败的那条显示原因', withHistory.fail === 1, `${withHistory.fail} 行失败`)
+        // 取消 ≠ 失败：既不能标成「已完成」（那是骗人），也不能标红（用户自己点的）
+        push(
+          '手动取消的那条显示「已取消」',
+          withHistory.text.some((t) => t.includes('已取消')),
+          ''
+        )
 
         // 排版这种事用眼睛看每回说法都不一样，直接量：进度条和它那行的数字中心对不上，
         // 就说明 flex 被挤换行了（数字掉到条下面，一行变两行）
@@ -4778,7 +8340,39 @@ function createWindow(): void {
 
         // 记在文件里（重启还在），不是只活在内存
         const persisted = loadTransferLog().filter((r) => r.id.startsWith('smoke-rec-'))
-        push('记录落盘且带双端路径', persisted.length === 2 && !!persisted[0].from && !!persisted[0].to, `${persisted.length} 条`)
+        push('记录落盘且带双端路径', persisted.length === 3 && !!persisted[0].from && !!persisted[0].to, `${persisted.length} 条`)
+
+        /**
+         * 拖高的效果得拿"记录比默认高度还多"的画面才看得出来：
+         * 现在的假记录只有 5 行、内容撑不满 260，拖到 420 只会多出一片空白。
+         * 所以临时塞 6 条长名字的记录，拖高、截图，再按 id 清掉（不碰用户真实历史）。
+         */
+        const extras = Array.from({ length: 6 }, (_, i) => ({
+          id: `smoke-extra-${i}`,
+          direction: (i % 2 ? 'download' : 'upload') as 'upload' | 'download',
+          filename: `backup-part-${i + 1}.tar.gz`,
+          from: i % 2 ? `/data/backup/backup-part-${i + 1}.tar.gz` : `D:\\backup\\backup-part-${i + 1}.tar.gz`,
+          to: i % 2 ? `C:\\Users\\admin\\Downloads\\backup-part-${i + 1}.tar.gz` : `/data/backup/backup-part-${i + 1}.tar.gz`,
+          name: `backup-part-${i + 1}.tar.gz`,
+          size: (900 + i * 40) * MB,
+          at: now - 86_400_000 - i * 3_600_000,
+          ms: 40_000 + i * 9_000
+        }))
+        for (const rec of extras) appendTransfer(rec)
+        mainWindow!.webContents.send('transfer:changed')
+        await wait(600)
+
+        await dragHead(-300)
+        const tall = await dockSize()
+        push('能拖到比默认更高的位置', tall.v > 260, `${tall.v}px`)
+        await shot('thshell-transfer-tall.png')
+
+        // 把临时记录清掉、高度拖回 260，再出正式截图
+        removeTransfer(extras.map((r) => r.id))
+        mainWindow!.webContents.send('transfer:changed')
+        await wait(500)
+        await dragHead(tall.v - 260)
+        await wait(200)
 
         await shot('thshell-transfer.png')
 
@@ -4976,6 +8570,8 @@ function registerIpc(): void {
   register('ssh:disconnect', (sessionId: string) => {
     ssh.disconnect(sessionId)
     clearMetricsState(sessionId)
+    clearProcState(sessionId)
+    clearServiceState(sessionId)
   })
   ipcMain.on('ssh:write', (_e, sessionId: string, data: string) => ssh.write(sessionId, data))
   ipcMain.on('ssh:resize', (_e, sessionId: string, cols: number, rows: number) =>
@@ -4987,6 +8583,67 @@ function registerIpc(): void {
   )
   register('ssh:sysinfo', (sessionId: string) =>
     collectSystemInfo((command) => ssh.exec(sessionId, command))
+  )
+
+  // ---------- 进程监控（htop 那一页） ----------
+  register('ssh:procs', (sessionId: string) =>
+    collectProcesses(sessionId, (command) => ssh.exec(sessionId, command))
+  )
+  register('ssh:proc-kill', (sessionId: string, pid: number, force: boolean) =>
+    killProcess((command) => ssh.exec(sessionId, command), pid, force)
+  )
+
+  // ---------- 系统页上的写操作：挂盘 / 配网 ----------
+  /**
+   * mount 一个卡住的设备（网络盘、坏道盘）会让 exec 永远不回话，
+   * 给它一个上限，别让界面一直转圈、用户以为点丢了。
+   */
+  const raceTimeout = <T>(task: Promise<T>, ms: number, what: string): Promise<T> =>
+    Promise.race([
+      task,
+      new Promise<T>((_resolve, reject) =>
+        setTimeout(() => reject(new Error(`${what} 超过 ${Math.round(ms / 1000)} 秒没有返回`)), ms)
+      )
+    ])
+
+  register('syscfg:disks', (sessionId: string) =>
+    listUnmountedDisks((command) => ssh.exec(sessionId, command))
+  )
+  register('syscfg:mount', (sessionId: string, req: MountRequest) =>
+    raceTimeout(mountDisk((command) => ssh.exec(sessionId, command), req), 30_000, '挂载')
+  )
+  register('syscfg:netconfig', (sessionId: string, device: string) =>
+    readNetConfig((command) => ssh.exec(sessionId, command), device)
+  )
+  register('syscfg:netapply', (sessionId: string, req: NetConfigApply) =>
+    raceTimeout(applyNetConfig((command) => ssh.exec(sessionId, command), req), 20_000, '保存网络配置')
+  )
+
+  // ---------- 系统服务（systemctl） ----------
+  register('services:list', (sessionId: string) =>
+    raceTimeout(collectServices((command) => ssh.exec(sessionId, command)), 20_000, '读取服务列表')
+  )
+  /*
+   * stop 一个卡住的 unit（比如 NFS 客户端、正在等 IO 的服务）systemctl 会阻塞，
+   * 30 秒还不回话就报错退出，别让界面一直转圈。
+   */
+  register('services:action', (sessionId: string, name: string, action: ServiceAction) =>
+    raceTimeout(
+      serviceAction((command) => ssh.exec(sessionId, command), sessionId, name, action),
+      30_000,
+      `${name} 操作`
+    )
+  )
+  /*
+   * 日志量可以很大（-n 2000），但 journalctl 是本地读文件，正常几秒就回。
+   * 超时不是「卡住」而是远端 IO 真的慢，如实报错比无限转圈好。
+   */
+  register('services:logs', (sessionId: string, name: string, query: ServiceLogQuery) =>
+    raceTimeout(
+      serviceLogs((command) => ssh.exec(sessionId, command), sessionId, name, query),
+      20_000,
+      `${name} 日志`
+    )
   )
 
   // ---------- 本地终端 ----------
@@ -5008,8 +8665,8 @@ function registerIpc(): void {
   register('docker:container-action', (sessionId: string, id: string, action: any, force?: boolean) =>
     dockerContainerAction(dock(sessionId), id, action, force)
   )
-  register('docker:container-logs', (sessionId: string, id: string, tail?: number) =>
-    dockerContainerLogs(dock(sessionId), id, tail)
+  register('docker:container-logs', (sessionId: string, id: string, tail?: number, since?: string) =>
+    dockerContainerLogs(dock(sessionId), id, tail, since)
   )
   register('docker:container-detail', (sessionId: string, id: string) =>
     dockerContainerDetail(dock(sessionId), id)
@@ -5058,7 +8715,7 @@ function registerIpc(): void {
         canceled: p.canceled
       })
       // 让界面重新拉一次列表：记录是主进程写的，渲染层只能被动知道
-      safeSend('transfer:changed')
+      safeSend('transfer:changed', null)
     }
     safeSend('sftp:progress', p)
   }

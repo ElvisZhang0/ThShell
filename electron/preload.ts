@@ -1,15 +1,25 @@
 import { clipboard, contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
   AppConfig,
+  ConfigResult,
   ExecResult,
   FileEntry,
   MetricSnapshot,
+  MountRequest,
+  NetConfigApply,
+  NetConfigInfo,
+  ProcSnapshot,
   ServerConfig,
+  ServiceAction,
+  ServiceLogQuery,
+  ServiceLogResult,
+  ServiceSnapshot,
   SessionState,
   SystemInfo,
   ThShellApi,
   TransferProgress,
   TransferRecord,
+  UnmountedDisk,
   UpdateProgress
 } from './types'
 
@@ -42,8 +52,30 @@ const api: ThShellApi = {
       ipcRenderer.invoke('ssh:metrics', sessionId),
     sysinfo: (sessionId: string): Promise<SystemInfo | null> =>
       ipcRenderer.invoke('ssh:sysinfo', sessionId),
+    procs: (sessionId: string): Promise<ProcSnapshot> =>
+      ipcRenderer.invoke('ssh:procs', sessionId),
+    killProc: (sessionId: string, pid: number, force: boolean): Promise<string> =>
+      ipcRenderer.invoke('ssh:proc-kill', sessionId, pid, force),
     onData: (cb) => subscribe<{ sessionId: string; data: string }>('ssh:data', cb),
     onState: (cb) => subscribe<SessionState>('ssh:state', cb)
+  },
+  syscfg: {
+    disks: (sessionId: string): Promise<UnmountedDisk[]> =>
+      ipcRenderer.invoke('syscfg:disks', sessionId),
+    mount: (sessionId: string, req: MountRequest): Promise<ConfigResult> =>
+      ipcRenderer.invoke('syscfg:mount', sessionId, req),
+    netConfig: (sessionId: string, device: string): Promise<NetConfigInfo> =>
+      ipcRenderer.invoke('syscfg:netconfig', sessionId, device),
+    netApply: (sessionId: string, req: NetConfigApply): Promise<ConfigResult> =>
+      ipcRenderer.invoke('syscfg:netapply', sessionId, req)
+  },
+  services: {
+    list: (sessionId: string): Promise<ServiceSnapshot> =>
+      ipcRenderer.invoke('services:list', sessionId),
+    action: (sessionId: string, name: string, action: ServiceAction): Promise<string> =>
+      ipcRenderer.invoke('services:action', sessionId, name, action),
+    logs: (sessionId: string, name: string, query: ServiceLogQuery): Promise<ServiceLogResult> =>
+      ipcRenderer.invoke('services:logs', sessionId, name, query)
   },
   shell: {
     open: (cols = 120, rows = 30) => ipcRenderer.invoke('shell:open', cols, rows),
@@ -158,8 +190,8 @@ const api: ThShellApi = {
       action: 'start' | 'stop' | 'restart' | 'pause' | 'unpause' | 'kill' | 'remove',
       force?: boolean
     ) => ipcRenderer.invoke('docker:container-action', sessionId, id, action, force),
-    containerLogs: (sessionId: string, id: string, tail?: number) =>
-      ipcRenderer.invoke('docker:container-logs', sessionId, id, tail),
+    containerLogs: (sessionId: string, id: string, tail?: number, since?: string) =>
+      ipcRenderer.invoke('docker:container-logs', sessionId, id, tail, since),
     containerDetail: (sessionId: string, id: string) =>
       ipcRenderer.invoke('docker:container-detail', sessionId, id),
     images: (sessionId: string) => ipcRenderer.invoke('docker:images', sessionId),

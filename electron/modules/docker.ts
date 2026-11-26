@@ -203,16 +203,24 @@ export async function dockerContainerAction(
   return (stdout || stderr).trim()
 }
 
-/** 日志：--timestamps 让「什么时候炸的」能直接看出来；tail 由界面给（默认 300 行） */
+/**
+ * 日志：--timestamps 让「什么时候炸的」能直接看出来；tail 由界面给（默认 300 行）。
+ *
+ * since 给了就只取该时刻之后的日志（实时跟随用增量拉，避免整屏重排把用户
+ * 正在看的位置拽走）。since 必须是 docker 认的 RFC3339 时间戳，白名单过滤防注入。
+ */
 export async function dockerContainerLogs(
   exec: ExecFn,
   id: string,
-  tail = 300
+  tail = 300,
+  since = ''
 ): Promise<string> {
   const n = Math.min(Math.max(Math.trunc(tail) || 300, 1), 5000)
   const ref = sh(safeRef(id))
-  const { stdout, stderr } = await exec(`docker logs --tail ${n} --timestamps ${ref} 2>&1`)
-  return stdout || stderr || '（没有输出）'
+  const pick = /^[\dT:.Z+-]+$/.test(since) ? `--since ${sh(since)}` : `--tail ${n}`
+  const { stdout } = await exec(`docker logs ${pick} --timestamps ${ref} 2>&1`)
+  // 2>&1 已经把报错合并进 stdout；增量模式下空输出就是「这一轮没有新日志」
+  return stdout || (since ? '' : '（没有输出）')
 }
 
 /** 详情：inspect 原文（JSON）+ 一次 stats 快照（CPU/内存/网络/磁盘） */

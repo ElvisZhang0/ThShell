@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Box,
   Coin,
+  DocumentCopy,
   Files,
   FolderOpened,
   Grid,
@@ -149,7 +150,12 @@ onMounted(() => {
   }
 })
 
-onBeforeUnmount(stopTimer)
+onBeforeUnmount(() => {
+  stopTimer()
+  stopLogTimer()
+  window.removeEventListener('selectionchange', onSelectionChange)
+  window.removeEventListener('keydown', onLogKeydown, true)
+})
 
 /* ---------------- 展示辅助 ---------------- */
 
@@ -287,38 +293,226 @@ function openShell(c: DockerContainer) {
 /* ---------------- 日志 ---------------- */
 
 const logVisible = ref(false)
-const logText = ref('')
+const logLines = ref<string[]>([])
+const logText = computed(() => logLines.value.join('\n'))
 const logTarget = ref<DockerContainer | null>(null)
 const logTail = ref(300)
 const logLoading = ref(false)
-const logFollow = ref(true)
+/** 实时跟随：每 1.5s 用 --since 增量补，效果等同 `docker logs -f` */
+const logLive = ref(true)
+/** 用户是否停在底部；向上翻看历史时不去抢滚动位置 */
+const logPinned = ref(true)
+/** 已渲染日志里最新的时间戳，下一轮从这儿往后拉 */
+const logSince = ref('')
+let logTimer: number | undefined
+let logBusy = false
+
+/** docker --timestamps 的前缀：2026-11-23T07:27:53.123456789Z（个别版本带 +08:00 偏移） */
+const TS_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/
+
+function logSplit(raw: string): string[] {
+  const text = raw.replace(/\n+$/, '')
+  return text ? text.split('\n') : []
+}
+
+function logEl(): HTMLElement | null {
+  return document.querySelector('.log-body')
+}
+
+function scrollLogToBottom() {
+  const el = logEl()
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function onLogScroll() {
+  const el = logEl()
+  if (!el) return
+  // 容 24px 误差：滚轮最后一下经常差几个像素没到底
+  logPinned.value = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+}
+
+function jumpToBottom() {
+  logPinned.value = true
+  scrollLogToBottom()
+}
+
+/* ---- 选中复制 ---- */
+
+/**
+ * 日志区里有没有活动的选区。
+ * pre 的正文是靠 textContent 整体更新的，一更新选区就没了 ——
+ * 用户拖到一半被清空，是最典型的"选不上、复制不了"。
+ */
+function logSelectionActive(): boolean {
+  const el = logEl()
+  if (!el) return false
+  const sel = window.getSelection()
+  if (!sel || sel.isCollapsed || !sel.toString()) return false
+  return (!!sel.anchorNode && el.contains(sel.anchorNode)) ||
+    (!!sel.focusNode && el.contains(sel.focusNode))
+}
+
+/** 选区还在时冻结实时刷新；一松开（点别处 / 复制完）立刻补上落下的日志 */
+const logFrozen = ref(false)
+
+function onSelectionChange() {
+  if (!logVisible.value) return
+  if (logSelectionActive()) {
+    logFrozen.value = true
+    return
+  }
+  if (logFrozen.value) {
+    logFrozen.value = false
+    if (logLive.value && !logBusy) void refreshLogs(true)
+  }
+}
+
+async function copyText(text: string, tip: string) {
+  if (!text) return
+  try {
+    await window.api.clipboard.write(text)
+    ElMessage.success(tip)
+  } catch (err) {
+    ElMessage.error(`复制失败：${cleanError(err)}`)
+  }
+}
+
+async function copyAllLogs() {
+  await copyText(logText.value, `已复制全部日志（${logLines.value.length} 行）`)
+}
+
+/**
+ * Windows/Linux 上应用菜单被摘掉了（`setApplicationMenu(null)`），
+ * 不能指望系统默认的 Ctrl+C 一定把 pre 里的选区送进剪贴板，这里自己兜一手。
+ */
+function onLogKeydown(event: KeyboardEvent) {
+  if (!logVisible.value) return
+  if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey) return
+  if (event.key.toLowerCase() !== 'c') return
+  if (!logSelectionActive()) return
+  event.preventDefault()
+  const text = window.getSelection()?.toString() ?? ''
+  void copyText(text, `已复制 ${text.split('\n').length} 行日志`)
+}
 
 async function openLogs(c: DockerContainer) {
   logTarget.value = c
   logVisible.value = true
-  logText.value = ''
+  logLines.value = []
+  logSince.value = ''
+  logPinned.value = true
   await refreshLogs()
 }
 
-async function refreshLogs() {
+/** 切行数：窗口变了，时间戳游标作废，整段重拉 */
+async function reloadLogs() {
+  logSince.value = ''
+  await refreshLogs()
+}
+
+/**
+ * silent = 后台轮询：不闪刷新按钮的转圈，失败就悄悄停掉实时，避免每 1.5s 报一次错
+ */
+async function refreshLogs(silent = false) {
   const sid = sessionId()
-  if (!sid || !logTarget.value) return
-  logLoading.value = true
+  const target = logTarget.value
+  if (!sid || !target) return
+  if (logBusy) return
+  logBusy = true
+  if (!silent) logLoading.value = true
+  const since = logSince.value
   try {
-    logText.value = await window.api.docker.containerLogs(sid, logTarget.value.id, logTail.value)
-    if (logFollow.value) {
-      // 等 DOM 更新后再滚到底，否则拿到的是旧高度
-      requestAnimationFrame(() => {
-        const el = document.querySelector('.log-body')
-        if (el) el.scrollTop = el.scrollHeight
-      })
+    const raw = await window.api.docker.containerLogs(sid, target.id, logTail.value, since)
+    // 请求在途时用户可能已经关掉或换了容器，晚到的回包直接丢弃
+    if (logTarget.value?.id !== target.id) return
+
+    const fresh = logSplit(raw)
+    if (!since) {
+      logLines.value = fresh
+    } else {
+      // --since 是闭区间，上一轮最后一行会再回来一次，按时间戳去重
+      // （纳秒精度，正常不会误杀同一刻的不同行）
+      logLines.value.push(...fresh.filter((l) => {
+        const m = TS_RE.exec(l)
+        return !m || m[1] > since
+      }))
+      // 弹窗开着几小时会攒到几万行，给个上限，超出丢最早的
+      if (logLines.value.length > 20000) logLines.value = logLines.value.slice(-20000)
+    }
+
+    // 游标只往前推，绝不回退
+    for (let i = fresh.length - 1; i >= 0; i--) {
+      const m = TS_RE.exec(fresh[i])
+      if (m && m[1] > logSince.value) {
+        logSince.value = m[1]
+        break
+      }
+    }
+
+    if (logPinned.value) {
+      await nextTick()
+      scrollLogToBottom()
     }
   } catch (err) {
-    logText.value = `读取日志失败：${cleanError(err)}`
+    const msg = `读取日志失败：${cleanError(err)}`
+    // 后台轮询偶发失败（通道被占、网络抖）别整屏清空，只追加一行提示；
+    // 首屏就失败才把错误当作正文摆出来
+    if (!silent || logLines.value.length === 0) logLines.value = [msg]
+    else logLines.value.push(`—— ${msg}，已暂停自动刷新 ——`)
+    stopLogTimer()
+    // 定时器停了就把开关也如实关掉，别让用户对着一个勾着却不刷的「实时」
+    logLive.value = false
   } finally {
+    logBusy = false
     logLoading.value = false
   }
 }
+
+function stopLogTimer() {
+  if (logTimer) {
+    window.clearInterval(logTimer)
+    logTimer = undefined
+  }
+}
+
+function syncLogTimer() {
+  stopLogTimer()
+  if (!logVisible.value || !logLive.value) return
+  logTimer = window.setInterval(() => {
+    // 上一轮还没回来（网络慢）就跳过，别堆请求把 SSH 通道堵死
+    if (logBusy) return
+    // 用户正在日志里拖选：冻结，一更新选区就没了
+    if (logSelectionActive()) {
+      logFrozen.value = true
+      return
+    }
+    void refreshLogs(true)
+  }, 1500)
+}
+
+function onLogClosed() {
+  stopLogTimer()
+  logLines.value = []
+  logSince.value = ''
+  logTarget.value = null
+  logFrozen.value = false
+}
+
+watch([logVisible, logLive], () => {
+  if (!logVisible.value) {
+    stopLogTimer()
+    window.removeEventListener('selectionchange', onSelectionChange)
+    window.removeEventListener('keydown', onLogKeydown, true)
+    return
+  }
+  syncLogTimer()
+  // 选区变了要能立刻知道（松手 → 补上冻结期间落下的日志）
+  window.addEventListener('selectionchange', onSelectionChange)
+  // 捕获阶段：抢在其它全局快捷键之前把选区送进剪贴板
+  window.addEventListener('keydown', onLogKeydown, true)
+  // 从后台回来时补一次，别让用户盯着一段旧的日志等 1.5s
+  if (logLive.value) void refreshLogs(true)
+})
 
 /* ---------------- 详情 ---------------- */
 
@@ -844,22 +1038,32 @@ function reload() {
       :title="`容器日志 · ${logTarget?.name ?? ''}`"
       width="72%"
       class="log-dialog"
-      @closed="logText = ''"
+      @closed="onLogClosed"
     >
       <div class="log-tools">
-        <el-radio-group v-model="logTail" size="small" @change="refreshLogs">
+        <el-radio-group v-model="logTail" size="small" @change="reloadLogs">
           <el-radio-button :value="100">100 行</el-radio-button>
           <el-radio-button :value="300">300 行</el-radio-button>
           <el-radio-button :value="1000">1000 行</el-radio-button>
           <el-radio-button :value="3000">3000 行</el-radio-button>
         </el-radio-group>
-        <el-checkbox v-model="logFollow" size="small">自动滚到底</el-checkbox>
+        <el-checkbox v-model="logLive" size="small">
+          实时
+          <i v-if="logLive" class="live-dot" :class="{ hold: logFrozen }" />
+        </el-checkbox>
+        <span class="log-hint">
+          {{ logFrozen ? '选中中 · 已暂停' : logLive ? '每 1.5s' : '已停止' }}
+        </span>
         <div class="grow" />
-        <el-button size="small" :icon="Refresh" :loading="logLoading" @click="refreshLogs">
+        <el-button size="small" :icon="DocumentCopy" @click="copyAllLogs">复制全部</el-button>
+        <el-button size="small" :icon="Refresh" :loading="logLoading" @click="refreshLogs()">
           刷新
         </el-button>
       </div>
-      <pre class="log-body mono">{{ logText || '（没有输出）' }}</pre>
+      <div class="log-wrap">
+        <pre class="log-body mono" @scroll="onLogScroll">{{ logText || '（没有输出）' }}</pre>
+        <button v-if="!logPinned" class="log-jump" @click="jumpToBottom">↓ 跳到最新</button>
+      </div>
     </el-dialog>
 
     <!-- 详情 -->
@@ -1539,8 +1743,70 @@ function reload() {
 .log-tools {
   display: flex;
   align-items: center;
-  gap: 12px;
+  /* 不换行：行数档位 + 实时 + 说明 + 两颗按钮，窄窗口下靠收紧内边距和隐藏说明来让位，
+     一旦允许折行，第二行只会剩个「3000 行」孤零零挂着 */
+  flex-wrap: nowrap;
+  gap: 10px;
   margin-bottom: 10px;
+}
+
+/* 默认的 8px 15px 太占地方，四档加起来就顶掉半行了 */
+.log-tools :deep(.el-radio-button__inner) {
+  padding: 6px 10px;
+}
+
+/* Element Plus 自带的相邻外边距会让 flex gap 变成双份，窄窗口下就是它把这一行撑爆的 */
+.log-tools :deep(.el-checkbox),
+.log-tools :deep(.el-button + .el-button) {
+  margin: 0;
+}
+
+.log-hint {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+@media (max-width: 1120px) {
+  /* 窄窗口优先保控件，状态靠「实时」旁边那个点表达 */
+  .log-hint {
+    display: none;
+  }
+}
+
+/* 实时开关上的呼吸绿点：一眼确认「确实在跟着刷」 */
+.live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 0 rgb(34 197 94 / 60%);
+  animation: live-pulse 1.8s ease-out infinite;
+  vertical-align: 1px;
+}
+
+/* 正在选中文本时冻结刷新：不闪了，换成琥珀色，别让人以为「卡住了」 */
+.live-dot.hold {
+  background: #f59e0b;
+  animation: none;
+  box-shadow: none;
+}
+
+@keyframes live-pulse {
+  70% {
+    box-shadow: 0 0 0 5px rgb(34 197 94 / 0%);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgb(34 197 94 / 0%);
+  }
+}
+
+.log-wrap {
+  position: relative;
 }
 
 .log-body {
@@ -1555,6 +1821,35 @@ function reload() {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-all;
+  /* body 上是 user-select: none（界面文字不希望被拖选），日志是唯一要能选中复制的正文 */
+  user-select: text;
+  cursor: text;
+}
+
+.log-body::selection {
+  /* 深色底上浏览器默认的浅蓝选区会把字吃掉；纯色比带 alpha 的写法在各版本更稳 */
+  background: #2563eb;
+  color: #fff;
+}
+
+/* 用户上翻看历史时浮出来，点一下回到底部继续跟随 */
+.log-jump {
+  position: absolute;
+  right: 24px;
+  bottom: 16px;
+  padding: 5px 12px;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 999px;
+  background: rgb(24 32 44 / 92%);
+  color: #9fc3e8;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.log-jump:hover {
+  background: rgb(37 99 235 / 86%);
+  color: #fff;
 }
 
 .stats-row {
